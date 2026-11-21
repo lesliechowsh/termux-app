@@ -2089,12 +2089,6 @@ public final class TerminalEmulator {
     long scrollEventCount() {
         return mScrollEventCount;
     }
-    public int getCellWidthPixels() {
-        return mCellWidthPixels;
-    }
-    public int getCellHeightPixels() {
-        return mCellHeightPixels;
-    }
     void noteKittyPlacementPixelsReplaced() {
         mKittyPlacementGeneration++;
     }
