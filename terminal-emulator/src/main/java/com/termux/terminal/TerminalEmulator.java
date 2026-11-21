@@ -1,5 +1,7 @@
 package com.termux.terminal;
 
+import java.util.Map;
+
 import android.graphics.Bitmap;
 import android.util.Base64;
 
@@ -516,6 +518,51 @@ public final class TerminalEmulator {
 
     /** The kitty graphics protocol state and image store. */
     private final KittyGraphicsProtocol mKittyGraphics;
+
+    /** Desktop notifications a program asked for with {@code OSC 99}. */
+    private final KittyNotifications mKittyNotifications = new KittyNotifications();
+
+    /** The extended clipboard a program drives with {@code OSC 5522}; shares the OSC 52 callbacks. */
+    private final KittyClipboard mKittyClipboard = new KittyClipboard();
+
+    private final KittyClipboard.Handler mKittyClipboardHandler = new KittyClipboard.Handler() {
+        @Override
+        public void read(boolean pasted, KittyClipboard.ReadCallback callback) {
+            mSession.onReadClipboard(pasted, callback);
+        }
+
+        @Override
+        public void writeText(String text) {
+            mSession.onCopyTextToClipboard(text);
+        }
+
+        @Override
+        public void writeData(Map<String, byte[]> images, String text) {
+            mSession.onWriteClipboard(images, text);
+        }
+
+        @Override
+        public void write(String escapeSequence) {
+            mSession.write(escapeSequence);
+        }
+    };
+
+    private final KittyNotifications.Handler mKittyNotificationHandler = new KittyNotifications.Handler() {
+        @Override
+        public void show(KittyNotification notification) {
+            mSession.onKittyNotification(notification);
+        }
+
+        @Override
+        public void close(String id) {
+            mSession.onKittyNotificationClose(id);
+        }
+
+        @Override
+        public void write(String escapeSequence) {
+            mSession.write(escapeSequence);
+        }
+    };
     /** Bumped whenever kitty placements change so the view can invalidate. */
     long mKittyPlacementGeneration;
     /** Bumped on every screen scroll so kitty can scroll-checkpoint placements. */
@@ -524,6 +571,11 @@ public final class TerminalEmulator {
     private boolean mPlacingKittyGraphics;
     /** Whether any kitty cell has ever been drawn (view hook). */
     private boolean mHasAnyKittyCell;
+
+    /** Test-facing overload matching the upstream JVM test suite signature. */
+    public TerminalEmulator(TerminalOutput session, boolean boldWithBright, int columns, int rows, int cellWidthPixels, int cellHeightPixels, Integer transcriptRows, TerminalSessionClient client) {
+        this(session, columns, rows, cellWidthPixels, cellHeightPixels, transcriptRows, client);
+    }
 
     public TerminalEmulator(TerminalOutput session, int columns, int rows, int cellWidthPixels, int cellHeightPixels, Integer transcriptRows, TerminalSessionClient client) {
         mSession = session;
@@ -805,6 +857,14 @@ public final class TerminalEmulator {
     public void processCodePoint(int b) {
         mScreen.doTerminalBitmapsGC(300000);
 
+        // CAN and SUB cancel every escape string, including APC. APC is otherwise handled before
+        // the control-character switch because its payload may contain arbitrary control bytes.
+        if ((b == 24 || b == 26) && mEscapeState != ESC_NONE) {
+            finishSequence();
+            emitCodePoint(127);
+            return;
+        }
+
         if (mEscapeState == ESC_OSC && mIsFastPathOsc) {
             mContinueSequence = false;
             receiveOsc(b);
@@ -824,35 +884,24 @@ public final class TerminalEmulator {
         }
 
         // The Application Program-Control (APC) string might be arbitrary non-printable characters, so handle that early.
+        // kitty 序列跨多字节持续:状态保持直到 receiveApcEsc 遇到 ST 调 finishSequence(与 TL 一致)。
         if (mEscapeState == ESC_APC) {
-            mContinueSequence = false;
             receiveApc(b);
-            if (!mContinueSequence) mEscapeState = ESC_NONE;
             return;
         } else if (mEscapeState == ESC_APC__ESC) {
-            mContinueSequence = false;
             receiveApcEsc(b);
-            if (!mContinueSequence) mEscapeState = ESC_NONE;
             return;
         } else if (mEscapeState == ESC_APC_KITTY_PAYLOAD) {
-            mContinueSequence = false;
             receiveApcKittyPayload(b);
-            if (!mContinueSequence) mEscapeState = ESC_NONE;
             return;
         } else if (mEscapeState == ESC_APC_KITTY_PAYLOAD_ESCAPE) {
-            mContinueSequence = false;
             receiveApcKittyPayloadEsc(b);
-            if (!mContinueSequence) mEscapeState = ESC_NONE;
             return;
         } else if (mEscapeState == ESC_APC_IGNORE) {
-            mContinueSequence = false;
             receiveApcIgnore(b);
-            if (!mContinueSequence) mEscapeState = ESC_NONE;
             return;
         } else if (mEscapeState == ESC_APC_IGNORE_ESCAPE) {
-            mContinueSequence = false;
             receiveApcIgnoreEsc(b);
-            if (!mContinueSequence) mEscapeState = ESC_NONE;
             return;
         }
 
@@ -2211,8 +2260,31 @@ public final class TerminalEmulator {
         mScreen.collectVisibleKittyPlacements(topRow, rowCount, out);
     }
 
+    boolean hasKittyVirtualPlacement(long imageId, long placementId) {
+        return mKittyGraphics.hasVirtualPlacement(imageId, placementId);
+    }
+
     public void shutdownKittyGraphics() {
         mKittyGraphics.shutdown();
+    }
+
+    /** Tell a program in paste-events mode (DECSET 5522) that the user pasted. */
+    public void sendPasteEvent(java.util.List<String> mimeTypes) {
+        mKittyClipboard.pasteEvent(mimeTypes, System.currentTimeMillis(), mKittyClipboardHandler);
+    }
+
+    /** The user tapped a notification this terminal put up. */
+    public void kittyNotificationActivated(String id, int button) {
+        if (id == null) return;
+        String report = mKittyNotifications.activated(id, button);
+        if (report != null) mSession.write(report);
+    }
+
+    /** A notification this terminal put up went away without being tapped. */
+    public void kittyNotificationClosed(String id) {
+        if (id == null) return;
+        String report = mKittyNotifications.closed(id);
+        if (report != null) mSession.write(report);
     }
 
     public interface TopRowProvider {
@@ -3066,6 +3138,22 @@ public final class TerminalEmulator {
         }
 
         switch (value) {
+            case // Kitty extended clipboard: "5522;type=read|write|wdata|walias;payload".
+            5522:
+                mKittyClipboard.handle(textParameter, bellOrStringTerminator, mKittyClipboardHandler);
+                break;
+            case 99:
+                // The rich desktop notification (OSC 99). May arrive in pieces.
+                mKittyNotifications.handle(textParameter, mKittyNotificationHandler);
+                break;
+            case 777: {
+                // rxvt-unicode's notification: 777;notify;title;body.
+                String[] parts = textParameter.split(";", 3);
+                if (parts.length >= 2 && "notify".equals(parts[0])) {
+                    mSession.onNotification(parts[1], parts.length > 2 ? parts[2] : "");
+                }
+                break;
+            }
             case 0: // Change icon name and window title to T.
             case 1: // Change icon name to T.
             case 2: // Change window title to T.
@@ -3570,7 +3658,14 @@ public final class TerminalEmulator {
     }
 
     private void finishSequence() {
+        // A cancelled kitty payload stream (CAN/SUB, or a runaway absorb) must tell the protocol
+        // layer; finishing after a clean ST is a no-op because finishStream() already closed it.
+        if (mEscapeState == ESC_APC_KITTY_PAYLOAD || mEscapeState == ESC_APC_KITTY_PAYLOAD_ESCAPE)
+            mKittyGraphics.abortStream();
+        mApcKitty = false;
+        mApcKittyBuffered = false;
         mEscapeState = ESC_NONE;
+        mApcSequenceLength = 0;
     }
 
     /**
@@ -3779,6 +3874,9 @@ public final class TerminalEmulator {
 
     /** Reset terminal state so user can interact with it regardless of present state. */
     public void reset() {
+        mKittyGraphics.reset();
+        mKittyNotifications.reset();
+        mKittyClipboard.reset();
         setCursorStyle();
         mArgIndex = 0;
         mContinueSequence = false;

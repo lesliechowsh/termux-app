@@ -307,6 +307,17 @@ public final class TerminalRow {
     }
 
 
+    public int getDisplayWidthAt(int charIndex) {
+        char c = mText[charIndex];
+        if (Character.isHighSurrogate(c)) return 2;
+        return WcWidth.width(c);
+    }
+
+    boolean hasTextSizes() {
+        // Kitty text sizing (OSC 66) is not modeled; no row ever carries a size record.
+        return false;
+    }
+
     boolean isBlank() {
         // A picture anchored here is content even over blank cells: a resize must not drop the row.
         if (mKittyPlacements != null && !mKittyPlacements.isEmpty()) return false;
