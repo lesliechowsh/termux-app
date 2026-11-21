@@ -277,7 +277,236 @@ public final class TerminalRow {
         }
     }
 
+    java.util.ArrayList<KittyPlacement> mKittyPlacements;
+
+    public boolean hasKittyPlacements() {
+        return mKittyPlacements != null && !mKittyPlacements.isEmpty();
+    }
+
+    void addKittyPlacement(KittyPlacement placement) {
+        if (mKittyPlacements == null) mKittyPlacements = new java.util.ArrayList<>(2);
+        mKittyPlacements.add(placement);
+        placement.anchor = this;
+    }
+
+    void removeKittyPlacement(KittyPlacement placement) {
+        if (mKittyPlacements != null && mKittyPlacements.remove(placement)
+            && mKittyPlacements.isEmpty())
+            mKittyPlacements = null;
+        if (placement.anchor == this) placement.anchor = null;
+    }
+
+    /** Detach every placement anchored here; returns whether there were any. */
+    boolean dropKittyPlacements() {
+        if (mKittyPlacements == null) return false;
+        for (KittyPlacement placement : mKittyPlacements) placement.anchor = null;
+        mKittyPlacements = null;
+        return true;
+    }
+
+    public void setChar(int columnToSet, int codePoint, long style) {
+        setChar(columnToSet, codePoint, style, TextStyle.DECORATION_COLOR_DEFAULT, 0);
+    }
+
+    // https://github.com/steven676/Android-Terminal-Emulator/commit/9a47042620bec87617f0b4f5d50568535668fe26
+    public void setChar(int columnToSet, int codePoint, long style, int decorationColor, int hyperlinkId) {
+        setChar(columnToSet, codePoint, style, decorationColor, hyperlinkId,
+            WcWidth.width(codePoint), true);
+    }
+
+    /**
+     * Write the first code point of a text sizing block's text into its anchor cell. The block's
+     * width comes from its record rather than from the character, so even a wide character is
+     * stored as one cell here and the cells beside it stay blank continuation cells.
+     */
+    public void setBlockAnchorChar(int column, int codePoint, long style, int decorationColor, int hyperlinkId) {
+        setChar(column, codePoint, style, decorationColor, hyperlinkId, 1, true);
+    }
+
+    /** Attach a code point to the existing grapheme without consuming another terminal cell. */
+    public void appendCodePointToCell(int column, int codePoint) {
+        setChar(column, codePoint, 0, TextStyle.DECORATION_COLOR_DEFAULT, 0, 0, false);
+    }
+
+    /** Promote a one-cell grapheme to two cells, overwriting the following cell safely. */
+    public boolean widenCell(int column) {
+        int start = findStartOfColumn(column);
+        if (mCharWidths[start] != 1 || column >= mColumns - 1) return false;
+        // A sized block already owns how many cells it covers; widening would eat its neighbour.
+        if (isTextSizeCell(column) || isTextSizeCell(column + 1)) return false;
+        if (wideDisplayCharacterStartingAt(column + 1))
+            setChar(column + 1, ' ', mStyle[column + 1]);
+        int nextStart = findStartOfColumn(column + 1);
+        int nextEnd = findStartOfColumn(column + 2);
+        int removed = nextEnd - nextStart;
+        System.arraycopy(mText, nextEnd, mText, nextStart, mSpaceUsed - nextEnd);
+        System.arraycopy(mCharWidths, nextEnd, mCharWidths, nextStart, mSpaceUsed - nextEnd);
+        mSpaceUsed -= removed;
+        mCharWidths[start] = 2;
+        mStyle[column + 1] = mStyle[column];
+        setDecorationColor(column + 1, getDecorationColor(column));
+        setHyperlinkId(column + 1, getHyperlinkId(column));
+        mHasNonOneWidthOrSurrogateChars = true;
+        return true;
+    }
+
+    private void setChar(int columnToSet, int codePoint, long style, int decorationColor,
+                         int hyperlinkId, int newCodePointDisplayWidth, boolean updateCellMetadata) {
+        if (columnToSet < 0 || columnToSet >= mStyle.length)
+            throw new IllegalArgumentException("TerminalRow.setChar(): columnToSet=" + columnToSet + ", codePoint=" + codePoint + ", style=" + style);
+        if (updateCellMetadata) {
+            mStyle[columnToSet] = style;
+            setDecorationColor(columnToSet, decorationColor);
+            setHyperlinkId(columnToSet, hyperlinkId);
+            // Writing ordinary text over a cell makes it a plain one again. Dropping the rest of
+            // the block it belonged to is TerminalBuffer's job, since only it can see other rows.
+            setTextSizeRecord(columnToSet, 0);
+            if (!mHasBitmap && TextStyle.isBitmap(style)) {
+                mHasBitmap = true;
+            }
+        }
+        // Fast path when we don't have any chars with width != 1
+        if (!mHasNonOneWidthOrSurrogateChars) {
+            if (codePoint >= Character.MIN_SUPPLEMENTARY_CODE_POINT || newCodePointDisplayWidth != 1) {
+                mHasNonOneWidthOrSurrogateChars = true;
+            } else {
+                mText[columnToSet] = (char) codePoint;
+                mCharWidths[columnToSet] = 1;
+                return;
+            }
+        }
+        final boolean newIsCombining = newCodePointDisplayWidth <= 0;
+        boolean wasExtraColForWideChar = (columnToSet > 0) && wideDisplayCharacterStartingAt(columnToSet - 1);
+        if (newIsCombining) {
+            // When standing at second half of wide character and inserting combining:
+            if (wasExtraColForWideChar)
+                columnToSet--;
+        } else {
+            // Check if we are overwriting the second half of a wide character starting at the previous column:
+            if (wasExtraColForWideChar)
+                setChar(columnToSet - 1, ' ', style);
+            // Check if we are overwriting the first half of a wide character starting at the next column:
+            boolean overwritingWideCharInNextColumn = newCodePointDisplayWidth == 2 && wideDisplayCharacterStartingAt(columnToSet + 1);
+            if (overwritingWideCharInNextColumn)
+                setChar(columnToSet + 1, ' ', style);
+        }
+        char[] text = mText;
+        final int oldStartOfColumnIndex = findStartOfColumn(columnToSet);
+        final int oldCodePointDisplayWidth = mCharWidths[oldStartOfColumnIndex];
+        // Get the number of elements in the mText array this column uses now
+        int oldCharactersUsedForColumn;
+        if (columnToSet + oldCodePointDisplayWidth < mColumns) {
+            int oldEndOfColumnIndex = findStartOfColumn(columnToSet + oldCodePointDisplayWidth);
+            oldCharactersUsedForColumn = oldEndOfColumnIndex - oldStartOfColumnIndex;
+        } else {
+            // Last character.
+            oldCharactersUsedForColumn = mSpaceUsed - oldStartOfColumnIndex;
+        }
+
+        // If MAX_COMBINING_CHARACTERS_PER_COLUMN already exist in column, then ignore adding additional combining characters.
+        if (newIsCombining) {
+            int combiningCharsCount = zeroWidthCodePointsCount(oldStartOfColumnIndex,
+                oldStartOfColumnIndex + oldCharactersUsedForColumn);
+            if (combiningCharsCount >= MAX_COMBINING_CHARACTERS_PER_COLUMN)
+                return;
+        }
+
+        // Find how many chars this column will need
+        int newCharactersUsedForColumn = Character.charCount(codePoint);
+        if (newIsCombining) {
+            // Combining characters are added to the contents of the column instead of overwriting them, so that they
+            // modify the existing contents.
+            // FIXME: Unassigned characters also get width=0.
+            newCharactersUsedForColumn += oldCharactersUsedForColumn;
+        }
+        int oldNextColumnIndex = oldStartOfColumnIndex + oldCharactersUsedForColumn;
+        int newNextColumnIndex = oldStartOfColumnIndex + newCharactersUsedForColumn;
+        final int javaCharDifference = newCharactersUsedForColumn - oldCharactersUsedForColumn;
+        if (javaCharDifference > 0) {
+            // Shift the rest of the line right.
+            int oldCharactersAfterColumn = mSpaceUsed - oldNextColumnIndex;
+            if (mSpaceUsed + javaCharDifference > text.length) {
+                // We need to grow the array
+                char[] newText = new char[text.length + mColumns];
+                byte[] newWidths = new byte[newText.length];
+                System.arraycopy(text, 0, newText, 0, oldNextColumnIndex);
+                System.arraycopy(text, oldNextColumnIndex, newText, newNextColumnIndex, oldCharactersAfterColumn);
+                System.arraycopy(mCharWidths, 0, newWidths, 0, oldNextColumnIndex);
+                System.arraycopy(mCharWidths, oldNextColumnIndex, newWidths, newNextColumnIndex,
+                    oldCharactersAfterColumn);
+                mText = text = newText;
+                mCharWidths = newWidths;
+            } else {
+                System.arraycopy(text, oldNextColumnIndex, text, newNextColumnIndex, oldCharactersAfterColumn);
+                System.arraycopy(mCharWidths, oldNextColumnIndex, mCharWidths, newNextColumnIndex,
+                    oldCharactersAfterColumn);
+            }
+        } else if (javaCharDifference < 0) {
+            // Shift the rest of the line left.
+            System.arraycopy(text, oldNextColumnIndex, text, newNextColumnIndex, mSpaceUsed - oldNextColumnIndex);
+            System.arraycopy(mCharWidths, oldNextColumnIndex, mCharWidths, newNextColumnIndex,
+                mSpaceUsed - oldNextColumnIndex);
+        }
+        mSpaceUsed += javaCharDifference;
+        // Store char. A combining character is stored at the end of the existing contents so that it modifies them:
+        //noinspection ResultOfMethodCallIgnored - since we already now how many java chars is used.
+        int storedAt = oldStartOfColumnIndex + (newIsCombining ? oldCharactersUsedForColumn : 0);
+        Character.toChars(codePoint, text, storedAt);
+        mCharWidths[storedAt] = (byte) newCodePointDisplayWidth;
+        if (Character.isSupplementaryCodePoint(codePoint)) mCharWidths[storedAt + 1] = -1;
+        if (oldCodePointDisplayWidth == 2 && newCodePointDisplayWidth == 1) {
+            // Replace second half of wide char with a space. Which mean that we actually add a ' ' java character.
+            if (mSpaceUsed + 1 > text.length) {
+                char[] newText = new char[text.length + mColumns];
+                byte[] newWidths = new byte[newText.length];
+                System.arraycopy(text, 0, newText, 0, newNextColumnIndex);
+                System.arraycopy(text, newNextColumnIndex, newText, newNextColumnIndex + 1, mSpaceUsed - newNextColumnIndex);
+                System.arraycopy(mCharWidths, 0, newWidths, 0, newNextColumnIndex);
+                System.arraycopy(mCharWidths, newNextColumnIndex, newWidths, newNextColumnIndex + 1,
+                    mSpaceUsed - newNextColumnIndex);
+                mText = text = newText;
+                mCharWidths = newWidths;
+            } else {
+                System.arraycopy(text, newNextColumnIndex, text, newNextColumnIndex + 1, mSpaceUsed - newNextColumnIndex);
+                System.arraycopy(mCharWidths, newNextColumnIndex, mCharWidths, newNextColumnIndex + 1,
+                    mSpaceUsed - newNextColumnIndex);
+            }
+            text[newNextColumnIndex] = ' ';
+            mCharWidths[newNextColumnIndex] = 1;
+            ++mSpaceUsed;
+        } else if (oldCodePointDisplayWidth == 1 && newCodePointDisplayWidth == 2) {
+            if (columnToSet == mColumns - 1) {
+                throw new IllegalArgumentException("Cannot put wide character in last column");
+            } else if (columnToSet == mColumns - 2) {
+                // Truncate the line to the second part of this wide char:
+                mSpaceUsed = newNextColumnIndex;
+            } else {
+                // Overwrite the contents of the next column, which mean we actually remove java characters. Due to the
+                // check at the beginning of this method we know that we are not overwriting a wide char.
+                int newNextNextColumnIndex = newNextColumnIndex + (Character.isHighSurrogate(mText[newNextColumnIndex]) ? 2 : 1);
+                int nextLen = newNextNextColumnIndex - newNextColumnIndex;
+                // Shift the array leftwards.
+                System.arraycopy(text, newNextNextColumnIndex, text, newNextColumnIndex, mSpaceUsed - newNextNextColumnIndex);
+                System.arraycopy(mCharWidths, newNextNextColumnIndex, mCharWidths, newNextColumnIndex,
+                    mSpaceUsed - newNextNextColumnIndex);
+                mSpaceUsed -= nextLen;
+            }
+        }
+    }
+
+    private int zeroWidthCodePointsCount(int start, int end) {
+        int count = 0;
+        for (int i = start; i < end; ) {
+            if (mCharWidths[i] == 0) count++;
+            i += Character.isHighSurrogate(mText[i]) ? 2 : 1;
+        }
+        return count;
+    }
+
+
     boolean isBlank() {
+        // A picture anchored here is content even over blank cells: a resize must not drop the row.
+        if (mKittyPlacements != null && !mKittyPlacements.isEmpty()) return false;
         for (int charIndex = 0, charLen = getSpaceUsed(); charIndex < charLen; charIndex++)
             if (mText[charIndex] != ' ') return false;
         return true;

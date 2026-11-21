@@ -249,6 +249,9 @@ public final class TerminalSession extends TerminalOutput {
             mShellExitStatus = exitStatus;
         }
 
+        // End kitty animation loops holding this session's emulator.
+        if (mEmulator != null) mEmulator.shutdownKittyGraphics();
+
         // Stop the reader and writer threads, and close the I/O streams
         mTerminalToProcessIOQueue.close();
         mProcessToTerminalIOQueue.close();

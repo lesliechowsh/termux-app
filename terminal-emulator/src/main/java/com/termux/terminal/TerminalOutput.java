@@ -29,4 +29,24 @@ public abstract class TerminalOutput {
 
     public abstract void onColorsChanged();
 
+
+    /**
+     * A kitty graphics animation flipped a stored frame. Call only when something changed a
+     * cell or byte of the screen buffer changing. The default has no client to tell.
+     */
+    public void onScreenChanged() {
+    }
+
+    /** Return work produced off-thread to the terminal's serialized update thread. */
+    public void postTerminalUpdate(Runnable update) {
+        update.run();
+    }
+
+    /** Run work on the terminal's serialized update thread after a delay. Default drops it. */
+    public void postTerminalUpdateDelayed(Runnable update, long delayMillis) {
+    }
+
+    /** Withdraw a pending {@link #postTerminalUpdateDelayed} of exactly this runnable. */
+    public void cancelTerminalUpdateDelayed(Runnable update) {
+    }
 }

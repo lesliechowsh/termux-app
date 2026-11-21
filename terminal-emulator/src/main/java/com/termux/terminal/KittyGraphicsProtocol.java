@@ -1,0 +1,2103 @@
+package com.termux.terminal;
+
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.os.SystemClock;
+
+import androidx.annotation.Nullable;
+
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.zip.DataFormatException;
+import java.util.zip.Inflater;
+
+/** A deliberately bounded Tier-1 implementation of kitty's APC graphics protocol. */
+final class KittyGraphicsProtocol {
+
+    static final int MAX_TRANSMITTED_BYTES = 16 * 1024 * 1024;
+    static final int MAX_DECODED_BYTES = 32 * 1024 * 1024;
+    private static final int MAX_CONTROL_BYTES = 2048;
+    private static final int MAX_CONTROLS = 64;
+
+    private static final ExecutorService PNG_DECODER = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "TermuxKittyPngDecoder");
+        thread.setDaemon(true);
+        return thread;
+    });
+
+    private final TerminalEmulator emulator;
+    private final TerminalOutput output;
+    private final KittyImageStore store = new KittyImageStore();
+    private Upload upload;
+    private long generation;
+    private long decodeBytesInFlight;
+    /**
+     * Changes to the placement layer, in stream order, behind the work still on the worker that
+     * comes before them: a display decode or a bounced placement holds its place here until its
+     * result is posted back, and a delete that arrives meanwhile queues behind it instead of landing
+     * first. A synchronized update (mode 2026) collects everything it carries into one batch entry
+     * that applies whole. See {@link #changeLayer} and {@link #land}.
+     */
+    private final ArrayDeque<LayerStep> layerSteps = new ArrayDeque<>();
+    /** The batch of the synchronized update still open, already in {@link #layerSteps}; or null. */
+    @Nullable private LayerStep window;
+    /** When {@link #window} opened, in {@link System#currentTimeMillis} time. */
+    private long windowOpenedAt;
+    /**
+     * When a window that outlived its screen hold must seal regardless; 0 while it lasts only as long
+     * as the hold. See {@link #synchronizedHoldEnded}.
+     */
+    private long windowGraceDeadline;
+    /**
+     * How long after it opened a window may stay open past its hold for a picture still arriving.
+     * A test in this package shortens it.
+     */
+    long windowUploadGraceMillis = WINDOW_UPLOAD_GRACE_MILLIS;
+    static final long WINDOW_UPLOAD_GRACE_MILLIS = 1000;
+    /** How many decodes this protocol has started: a test hook for "a re-placement decodes nothing". */
+    int decodeCount;
+    /** The worker decodes run on; a test in this package swaps in one it steps by hand. */
+    Executor decoder = PNG_DECODER;
+    /**
+     * Stands in for the platform decode of a display transmission in tests in this package, where
+     * the stub {@link Bitmap} decodes nothing. Null outside tests.
+     */
+    @Nullable BitmapProducer decodeForTests;
+
+    KittyGraphicsProtocol(TerminalEmulator emulator, TerminalOutput output) {
+        this.emulator = emulator;
+        this.output = output;
+    }
+
+    /** beginStream: feed the payload through {@link #streamFeed}; finish or abort ends it. */
+    static final int STREAM_UPLOAD = 0;
+    /** beginStream: keep buffering the whole APC string and hand it to {@link #accept} at ST. */
+    static final int STREAM_BUFFER = 1;
+    /** beginStream: the command was refused (and answered); discard the payload up to ST. */
+    static final int STREAM_REJECT = 2;
+
+    @Nullable private Upload streamUpload;
+    @Nullable private Command streamCommand;
+    private boolean streamOpen;
+    private int streamAccumulator;
+    private int streamBits;
+    private int streamUseful;
+    private boolean streamPadding;
+
+    /**
+     * Start a streamed direct transmission for one APC whose control data ended at ';'. Streaming
+     * exists because real clients (kitten icat among them) send a whole image as ONE unchunked APC,
+     * far past any sane bound on a buffered escape string: the payload is base64-decoded as it
+     * arrives, into the same accumulation buffer a chunked upload uses, so one image costs its
+     * decoded bytes once — never a string copy of the encoded stream.
+     */
+    int beginStream(String controlData) {
+        Command command;
+        try {
+            command = Command.parse(controlData);
+        } catch (IllegalArgumentException e) {
+            reply(null, "EINVAL:" + printable(e.getMessage()), true, true);
+            return STREAM_REJECT;
+        }
+        switch (command.action) {
+            // Payload-less or small-payload commands keep the buffered path so accept() can run
+            // them whole at ST; only pixel transmissions are worth streaming.
+            case 'd': case 'q': case 'p': case 'a': case 'c':
+                return STREAM_BUFFER;
+        }
+        // t=f/t=t carry a file path, not pixels: a handful of bytes the buffered path reads (and
+        // answers) whole, and t=s still has to reach its ENOSYS answer in uploadTargetFor.
+        if (command.medium != 'd') return STREAM_BUFFER;
+        Upload target = uploadTargetFor(command);
+        if (target == null) return STREAM_REJECT;
+        streamUpload = target;
+        streamCommand = command;
+        streamOpen = true;
+        streamAccumulator = 0;
+        streamBits = 0;
+        streamUseful = 0;
+        streamPadding = false;
+        return STREAM_UPLOAD;
+    }
+
+    /** Feed one payload code point; false once the stream failed (the caller then absorbs to ST). */
+    boolean streamFeed(int c) {
+        if (!streamOpen) return false;
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') return true;
+        if (c == '=') {
+            streamPadding = true;
+            return true;
+        }
+        if (streamPadding || c < 0 || c > 127) return streamFail("EINVAL:invalid base64 payload");
+        int value = base64Value((char) c);
+        if (value < 0) return streamFail("EINVAL:invalid base64 payload");
+        streamAccumulator = (streamAccumulator << 6) | value;
+        streamBits += 6;
+        streamUseful++;
+        if (streamBits >= 8) {
+            streamBits -= 8;
+            if (streamUpload.data.size() >= MAX_TRANSMITTED_BYTES)
+                return streamFail("ENOSPC:image exceeds transmission limit");
+            streamUpload.data.write((streamAccumulator >> streamBits) & 0xff);
+        }
+        return true;
+    }
+
+    /** Bulk variant for a run of plain ASCII payload bytes; the emulator's hot path. */
+    boolean streamFeed(byte[] buffer, int offset, int length) {
+        if (!streamOpen) return false;
+        ByteArrayOutputStream data = streamUpload.data;
+        int accumulator = streamAccumulator;
+        int bits = streamBits;
+        for (int i = offset; i < offset + length; i++) {
+            char c = (char) (buffer[i] & 0xff);
+            if (c == ' ') continue;
+            if (c == '=') {
+                streamPadding = true;
+                continue;
+            }
+            int value;
+            if (streamPadding || (value = base64Value(c)) < 0) {
+                streamAccumulator = accumulator;
+                streamBits = bits;
+                return streamFail("EINVAL:invalid base64 payload");
+            }
+            accumulator = (accumulator << 6) | value;
+            bits += 6;
+            streamUseful++;
+            if (bits >= 8) {
+                bits -= 8;
+                if (data.size() >= MAX_TRANSMITTED_BYTES) {
+                    streamAccumulator = accumulator;
+                    streamBits = bits;
+                    return streamFail("ENOSPC:image exceeds transmission limit");
+                }
+                data.write((accumulator >> bits) & 0xff);
+            }
+        }
+        streamAccumulator = accumulator;
+        streamBits = bits;
+        return true;
+    }
+
+    /** The ST arrived: validate the base64 tail and dispatch exactly as a buffered chunk would. */
+    void finishStream() {
+        if (!streamOpen) return;
+        if ((streamUseful & 3) == 1
+            || (streamBits > 0 && (streamAccumulator & ((1 << streamBits) - 1)) != 0)) {
+            streamFail("EINVAL:invalid base64 payload");
+            return;
+        }
+        Upload target = streamUpload;
+        Command command = streamCommand;
+        clearStream();
+        if (command.more) {
+            upload = target;
+            return;
+        }
+        upload = null;
+        dispatchCompleted(target);
+    }
+
+    /**
+     * The sequence was cancelled (CAN/SUB, or a terminal reset) mid-payload. Silent, like the
+     * buffered path dropping its string — but a continuation target already holds partial bytes,
+     * so the whole chunked upload is dropped rather than left corrupt.
+     */
+    void abortStream() {
+        if (!streamOpen) return;
+        if (upload == streamUpload) upload = null;
+        clearStream();
+    }
+
+    private boolean streamFail(String status) {
+        if (upload == streamUpload) upload = null;
+        Command command = streamCommand;
+        clearStream();
+        reply(command, status, true, false);
+        return false;
+    }
+
+    private void clearStream() {
+        streamUpload = null;
+        streamCommand = null;
+        streamOpen = false;
+    }
+
+    /**
+     * The upload one payload-carrying command appends to: the in-flight chunked upload for a
+     * continuation, a fresh one for a validated new transmission, or null when the command was
+     * refused (already answered) — the pre-payload half of {@link #accept}, shared with streaming.
+     */
+    @Nullable
+    private Upload uploadTargetFor(Command command) {
+        if (upload != null) {
+            if (command.isContinuation()) return upload;
+            Upload abandoned = upload;
+            upload = null;
+            reply(abandoned.command, "EINVAL:chunk upload interrupted", true, false);
+        }
+        if (command.action == 'p') {
+            handlePlacement(command);
+            return null;
+        }
+        if (command.action == 'a') {
+            handleAnimationControl(command);
+            return null;
+        }
+        if (command.action == 'c') {
+            handleCompose(command);
+            return null;
+        }
+        if (command.action != 'T' && command.action != 't' && command.action != 'f') {
+            reply(command, "ENOSYS:unsupported action", true, false);
+            return null;
+        }
+        if (command.placeholder != 0 && command.placeholder != 1) {
+            reply(command, "EINVAL:unsupported unicode placeholder mode", true, false);
+            return null;
+        }
+        if (command.placeholder == 1 && command.action != 'T') {
+            reply(command, "EINVAL:U is only valid for display commands", true, false);
+            return null;
+        }
+        if (!isSupportedMedium(command.medium)) {
+            reply(command, "ENOSYS:unsupported transmission medium", true, false);
+            return null;
+        }
+        if (command.format != 100 && command.format != 24 && command.format != 32) {
+            reply(command, "ENOSYS:unsupported image format", true, false);
+            return null;
+        }
+        if (command.format != 100) {
+            if (command.width <= 0 || command.height <= 0) {
+                reply(command, "EINVAL:raw pixel data requires s and v", true, false);
+                return null;
+            }
+            if ((long) command.width * command.height * 4L > MAX_DECODED_BYTES) {
+                reply(command, "ENOSPC:decoded image exceeds session limit", true, false);
+                return null;
+            }
+        }
+        if (command.compression != 0 && command.compression != 'z') {
+            reply(command, "ENOSYS:unsupported compression", true, false);
+            return null;
+        }
+        if (command.action == 'f') {
+            // Frame data needs an existing image, and a raw frame's rectangle is checkable now.
+            KittyImageStore.Entry entry = store.get(store.resolveId(command.imageId, command.number));
+            if (entry == null) {
+                reply(command, "ENOENT:image not found", true, false);
+                return null;
+            }
+            if (command.format != 100
+                && !frameRectFits(entry, command.srcX, command.srcY, command.width, command.height)) {
+                reply(command, "EINVAL:frame rectangle out of bounds", true, false);
+                return null;
+            }
+        }
+        return new Upload(command);
+    }
+
+    void accept(String apc) {
+        if (apc == null || apc.length() < 2 || apc.charAt(0) != 'G') return;
+        // The payload, and therefore the ';' separator, is optional: a control-only command is well
+        // formed. Requiring the separator made the canonical delete form (ESC _ G a=d ESC \) and the
+        // control-only header that real clients send before chunked data fail with EINVAL.
+        int separator = apc.indexOf(';', 1);
+        String controlData = separator < 0 ? apc.substring(1) : apc.substring(1, separator);
+        String payload = separator < 0 ? "" : apc.substring(separator + 1);
+        Command command;
+        try {
+            command = Command.parse(controlData);
+        } catch (IllegalArgumentException e) {
+            reply(null, "EINVAL:" + printable(e.getMessage()), true, true);
+            return;
+        }
+
+        if (command.action == 'd') {
+            // A delete ends a chunked upload, but it no longer cancels the decodes in flight: it is
+            // queued behind them instead (see handleDelete), which reaches the same end state
+            // without a frame where the old picture is gone and its replacement has not landed.
+            upload = null;
+            handleDelete(command);
+            return;
+        }
+        if (command.action == 'q') {
+            handleQuery(command, payload);
+            return;
+        }
+        Upload target = uploadTargetFor(command);
+        if (target == null) return;
+        appendChunk(target, command, payload);
+    }
+
+    private static boolean frameRectFits(KittyImageStore.Entry entry, int x, int y, int w, int h) {
+        return x >= 0 && y >= 0 && w > 0 && h > 0
+            && (long) x + w <= entry.width && (long) y + h <= entry.height;
+    }
+
+    private void appendChunk(Upload target, Command chunkCommand, String payload) {
+        byte[] decoded;
+        try {
+            decoded = decodeBase64(payload);
+        } catch (IllegalArgumentException e) {
+            if (upload == target) upload = null;
+            reply(target.command, "EINVAL:invalid base64 payload", true, false);
+            return;
+        }
+        if (decoded.length > MAX_TRANSMITTED_BYTES - target.data.size()) {
+            if (upload == target) upload = null;
+            reply(target.command, "ENOSPC:image exceeds transmission limit", true, false);
+            return;
+        }
+        target.data.write(decoded, 0, decoded.length);
+        if (chunkCommand.more) {
+            upload = target;
+            return;
+        }
+        upload = null;
+        dispatchCompleted(target);
+    }
+
+    /**
+     * A completed transmission's payload, dispatched to the right submit path. For t=f/t=t the
+     * bytes collected were a file path and the pixels come from that file instead.
+     */
+    private void dispatchCompleted(Upload target) {
+        byte[] transmitted = target.data.toByteArray();
+        if (target.command.medium != 'd') {
+            transmitted = readTransmissionFile(target.command, transmitted, false);
+            if (transmitted == null) return; // readTransmissionFile already answered.
+        }
+        if (target.command.action == 'f') {
+            submitFrame(target.command, transmitted);
+        } else if (target.command.format == 100) {
+            submitPng(target.command, transmitted);
+        } else {
+            submitRaw(target.command, transmitted);
+        }
+    }
+
+    private static boolean isSupportedMedium(char medium) {
+        return medium == 'd' || medium == 'f' || medium == 't';
+    }
+
+    /**
+     * Resolve a file transmission ({@code t=f}, and {@code t=t} for a file the terminal consumes):
+     * the payload was the base64 of a path, and the pixel data is that file's contents windowed by
+     * {@code O=} (offset) and {@code S=} (size). Returns null after replying when the file cannot be
+     * used. Reading is synchronous, exactly as a direct payload's bytes arrive synchronously —
+     * nothing downstream can start without the PNG header — so it is held to a regular file and to
+     * the same {@link #MAX_TRANSMITTED_BYTES} ceiling: a FIFO or a device node would otherwise park
+     * the terminal thread forever on a read that never ends.
+     */
+    @Nullable
+    private byte[] readTransmissionFile(Command command, byte[] pathBytes, boolean always) {
+        String path = new String(pathBytes, StandardCharsets.UTF_8);
+        if (path.isEmpty()) {
+            reply(command, "EINVAL:file transmission requires a path", true, always);
+            return null;
+        }
+        File file;
+        try {
+            file = new File(path).getCanonicalFile();
+        } catch (IOException | SecurityException e) {
+            reply(command, "EBADF:cannot read transmission file", true, always);
+            return null;
+        }
+        // t=t hands the file over, but the restriction the spec puts on it is on the deletion, not
+        // on the read — a client that may name a path for t=f may name the same path for t=t. So an
+        // unsafe path is read and left alone rather than refused: only a file written for this
+        // protocol, in a temporary directory, is ever deleted.
+        boolean deletable = command.medium == 't' && isProtocolTempFile(file);
+        byte[] data = null;
+        String error = null;
+        try {
+            if (!file.isFile()) {
+                error = "EBADF:cannot read transmission file";
+            } else {
+                long length = file.length();
+                long offset = command.fileOffset;
+                long wanted = command.fileSize > 0
+                    ? Math.min((long) command.fileSize, Math.max(0, length - offset))
+                    : Math.max(0, length - offset);
+                if (offset < 0 || offset > length || wanted <= 0) {
+                    error = "EINVAL:file transmission window is empty";
+                } else if (wanted > MAX_TRANSMITTED_BYTES) {
+                    error = "ENOSPC:image exceeds transmission limit";
+                } else {
+                    data = new byte[(int) wanted];
+                    try (RandomAccessFile input = new RandomAccessFile(file, "r")) {
+                        input.seek(offset);
+                        input.readFully(data);
+                    }
+                }
+            }
+        } catch (IOException | RuntimeException | OutOfMemoryError e) {
+            data = null;
+            error = "EBADF:cannot read transmission file";
+        } finally {
+            // Deleted whether or not it could be read: the client handed the file over.
+            if (deletable) //noinspection ResultOfMethodCallIgnored
+                file.delete();
+        }
+        if (data == null) {
+            reply(command, error, true, always);
+            return null;
+        }
+        return data;
+    }
+
+    /**
+     * kitty only deletes a {@code t=t} file whose path carries the protocol marker and sits in a
+     * temporary directory. On Android the platform temporary
+     * directory is the package's own {@code files/usr/tmp} — what {@code $TMPDIR} points at inside
+     * the app's shell — so it counts alongside the desktop's {@code /tmp} and {@code /dev/shm}.
+     */
+    private static boolean isProtocolTempFile(File file) {
+        String path = file.getPath();
+        if (!path.contains("tty-graphics-protocol")) return false;
+        return isUnder(path, "/tmp") || isUnder(path, "/dev/shm")
+            || isUnder(path, System.getenv("TMPDIR"))
+            || isUnder(path, System.getProperty("java.io.tmpdir"))
+            || path.contains("/files/usr/tmp/");
+    }
+
+    private static boolean isUnder(String path, @Nullable String root) {
+        if (root == null || root.isEmpty()) return false;
+        String prefix = root.endsWith("/") ? root : root + "/";
+        return path.startsWith(prefix);
+    }
+
+    private void handleQuery(Command command, String payload) {
+        if (!isSupportedMedium(command.medium)) {
+            reply(command, "ENOSYS:unsupported transmission medium", true, true);
+            return;
+        }
+        byte[] decoded;
+        try {
+            decoded = decodeBase64(payload);
+        } catch (IllegalArgumentException e) {
+            reply(command, "EINVAL:invalid base64 payload", true, true);
+            return;
+        }
+        if (command.medium != 'd') {
+            // A query names a file exactly as a transmission does — including the temp-file rule
+            // and the deletion, so a probing client leaves no scratch file behind.
+            decoded = readTransmissionFile(command, decoded, true);
+            if (decoded == null) return; // readTransmissionFile already answered.
+        }
+        if (command.compression != 0 && command.compression != 'z') {
+            reply(command, "ENOSYS:unsupported compression", true, true);
+            return;
+        }
+        boolean valid;
+        if (command.format == 24 || command.format == 32) {
+            long required = (long) command.width * command.height * (command.format / 8);
+            if (command.compression == 'z') {
+                boolean inflates;
+                try {
+                    inflate(decoded, required);
+                    inflates = true;
+                } catch (IllegalArgumentException e) {
+                    inflates = false;
+                }
+                valid = command.width > 0 && command.height > 0 && inflates;
+            } else {
+                valid = command.width > 0 && command.height > 0 && required == decoded.length;
+            }
+        } else if (command.format == 100) {
+            valid = pngDimensions(decoded) != null;
+        } else {
+            reply(command, "ENOSYS:unsupported image format", true, true);
+            return;
+        }
+        reply(command, valid ? "OK" : "EINVAL:invalid image data", !valid, true);
+    }
+
+    private void submitPng(Command command, byte[] png) {
+        int[] dimensions = pngDimensions(png);
+        if (dimensions == null) {
+            reply(command, "EINVAL:invalid PNG", true, false);
+            return;
+        }
+        submitTransmission(command, png.length, dimensions[0], dimensions[1], () -> {
+            BitmapFactory.Options options = new BitmapFactory.Options();
+            options.inPreferredConfig = Bitmap.Config.ARGB_8888;
+            Bitmap bitmap = BitmapFactory.decodeByteArray(png, 0, png.length, options);
+            if (bitmap == null) throw new IllegalArgumentException("PNG decode failed");
+            return bitmap;
+        });
+    }
+
+    private void submitRaw(Command command, byte[] data) {
+        // An uncompressed payload's size is checked here so real clients get the mismatch answer
+        // synchronously; a compressed payload's size is only knowable after inflation on the worker.
+        if (command.compression == 0
+            && data.length != (long) command.width * command.height * (command.format / 8)) {
+            reply(command, "EINVAL:pixel data does not match s and v", true, false);
+            return;
+        }
+        submitTransmission(command, data.length, command.width, command.height, () -> {
+            byte[] pixels = command.compression == 'z'
+                ? inflate(data, (long) command.width * command.height * (command.format / 8))
+                : data;
+            return Bitmap.createBitmap(
+                rawPixelsToArgb(pixels, command.width, command.height, command.format),
+                command.width, command.height, Bitmap.Config.ARGB_8888);
+        });
+    }
+
+    /**
+     * A completed transmission. Fixes the effective image id and store reservation synchronously —
+     * which is what lets an {@code a=p} later in the stream resolve this image before its pixels
+     * have decoded — then routes to store-only ({@code a=t}) or display ({@code a=T}).
+     */
+    private void submitTransmission(Command command, int transmittedBytes, int sourceWidth,
+                                    int sourceHeight, BitmapProducer producer) {
+        long pixelBytes = (long) sourceWidth * sourceHeight * 4L;
+        if (pixelBytes <= 0 || pixelBytes > MAX_DECODED_BYTES) {
+            reply(command, "ENOSPC:decoded image exceeds session limit", true, false);
+            return;
+        }
+        boolean storeRequested = command.imageId != 0 || command.number != 0;
+        long effectiveId = command.imageId;
+        KittyImageStore.VirtualPlacement virtualPlacement = null;
+        if (command.placeholder == 1) {
+            if (!storeRequested) {
+                reply(command, "EINVAL:unicode placement requires i or I", true, true);
+                return;
+            }
+            virtualPlacement = createVirtualPlacement(command, sourceWidth, sourceHeight);
+            if (virtualPlacement == null) {
+                reply(command, "EINVAL:invalid unicode placement", true, false);
+                return;
+            }
+        }
+        if (command.action == 't' && !storeRequested) {
+            reply(command, "EINVAL:storing an image requires i or I", true, true);
+            return;
+        }
+        if (storeRequested) {
+            if (effectiveId == 0) effectiveId = store.assignFreeId();
+            int estimate = (int) pixelBytes;
+            // A full store first evicts older images nothing displays, as the spec asks.
+            if (!store.makeRoomForImage(effectiveId, estimate,
+                    imageId -> !emulator.kittyPlacementsFor(imageId).isEmpty())) {
+                if (command.action == 't' || command.placeholder == 1) {
+                    reply(command, "ENOSPC:image store is full", true, false, effectiveId);
+                    return;
+                }
+                // The display command still displays; only the stored copy is skipped, so a later
+                // a=p for this id answers ENOENT exactly as if the image had been evicted.
+                storeRequested = false;
+            } else {
+                if (command.action == 't' || command.placeholder == 1) {
+                    // Retransmission replaces the image, and its placements go with it.
+                    final long replacedId = effectiveId;
+                    changeLayer(() -> emulator.deleteKittyImageEverywhere(replacedId));
+                }
+                store.reserve(effectiveId, command.number, sourceWidth, sourceHeight, estimate);
+                if (virtualPlacement != null)
+                    store.putVirtualPlacement(store.get(effectiveId), virtualPlacement);
+            }
+        }
+        if (command.action == 't' || command.placeholder == 1) {
+            submitStoreOnly(command, transmittedBytes, effectiveId, producer);
+        } else {
+            submitDecode(command, transmittedBytes, effectiveId, storeRequested, sourceWidth, sourceHeight,
+                producer);
+        }
+    }
+
+    /** Store-only transmission: decode off-thread, attach to the reservation, no placement. */
+    private void submitStoreOnly(Command command, int transmittedBytes, long effectiveId,
+                                 BitmapProducer producer) {
+        if (decodeBytesInFlight + transmittedBytes > MAX_TRANSMITTED_BYTES) {
+            store.abandon(effectiveId);
+            reply(command, "ENOSPC:too much image data pending", true, false, effectiveId);
+            return;
+        }
+        final KittyImageStore.Entry reservation = store.get(effectiveId);
+        decodeBytesInFlight += transmittedBytes;
+        decoder.execute(() -> {
+            Bitmap bitmap = null;
+            String error = null;
+            try {
+                bitmap = (decodeForTests != null ? decodeForTests : producer).produce();
+                if (bitmap == null) {
+                    error = "EINVAL:image decode failed";
+                } else if (bitmap.getAllocationByteCount() > MAX_DECODED_BYTES) {
+                    bitmap.recycle();
+                    bitmap = null;
+                    error = "ENOSPC:decoded image exceeds session limit";
+                }
+            } catch (IllegalArgumentException e) {
+                error = "EINVAL:" + printable(e.getMessage());
+                if (bitmap != null) bitmap.recycle();
+                bitmap = null;
+            } catch (RuntimeException | OutOfMemoryError e) {
+                error = "ENOMEM:image decode failed";
+                if (bitmap != null) bitmap.recycle();
+                bitmap = null;
+            }
+            final Bitmap result = bitmap;
+            final String decodeError = error;
+            output.postTerminalUpdate(() -> {
+                decodeBytesInFlight = Math.max(0, decodeBytesInFlight - transmittedBytes);
+                if (decodeError != null) {
+                    if (store.get(effectiveId) == reservation) store.abandon(effectiveId);
+                    reply(command, decodeError, true, false, effectiveId);
+                    return;
+                }
+                // A delete that raced the decode wins, and so does a later transmission under the
+                // same id, which may still show these pixels until its own land; the transmission
+                // succeeded either way.
+                int bytes = result.getAllocationByteCount();
+                boolean kept = store.get(effectiveId) == reservation
+                    ? store.complete(effectiveId, result, bytes)
+                    : store.offerStandIn(effectiveId, reservation, result, bytes);
+                if (!kept) result.recycle();
+                reply(command, "OK", false, false, effectiveId);
+            });
+        });
+    }
+
+    /**
+     * The shared display tail: bound checks, cursor advance, then decode off-thread. The producer
+     * returns the bitmap or throws {@link IllegalArgumentException} with the reply text after the
+     * {@code EINVAL:} prefix. When {@code storeRequested} is set the decode is also attached to this
+     * image's store reservation and the placement shares it; otherwise the placement owns it.
+     * Either way it is never scaled or copied: the renderer draws it at its display size.
+     */
+    private void submitDecode(Command command, int transmittedBytes, long effectiveId,
+                              boolean storeRequested, int sourceWidth, int sourceHeight,
+                              BitmapProducer producer) {
+        if (decodeBytesInFlight + transmittedBytes > MAX_TRANSMITTED_BYTES) {
+            if (storeRequested) store.abandon(effectiveId);
+            reply(command, "ENOSPC:too much image data pending", true, false, effectiveId);
+            return;
+        }
+        final long acceptedGeneration = generation;
+        final int row = emulator.getCursorRow();
+        final int col = emulator.getCursorCol();
+        final int cellWidth = Math.max(1, emulator.getCellWidthPixels());
+        final int cellHeight = Math.max(1, emulator.getCellHeightPixels());
+        if (command.cellOffsetX < 0 || command.cellOffsetX >= cellWidth
+            || command.cellOffsetY < 0 || command.cellOffsetY >= cellHeight) {
+            if (storeRequested) store.abandon(effectiveId);
+            reply(command, "EINVAL:cell offset outside cell", true, false, effectiveId);
+            return;
+        }
+        final int offsetX = command.cellOffsetX;
+        final int offsetY = command.cellOffsetY;
+        final int[] displaySize = displaySize(command, sourceWidth, sourceHeight, cellWidth, cellHeight);
+        if ((long) (displaySize[0] + offsetX) * (displaySize[1] + offsetY) * 4L > MAX_DECODED_BYTES) {
+            if (storeRequested) store.abandon(effectiveId);
+            reply(command, "ENOSPC:display image exceeds session limit", true, false, effectiveId);
+            return;
+        }
+        decodeBytesInFlight += transmittedBytes;
+        // The cursor advance below linefeeds over the image's rows right now, scrolling the screen
+        // when the cursor sits near the bottom, while the placement lands only after the decode. The
+        // captured row is a screen row, so it must drop by however many lines scroll in between —
+        // otherwise the image lands that many rows below its anchor, leaving blank lines above it.
+        final long scrollsAtSubmit = emulator.scrollEventCount();
+        emulator.advanceKittyGraphicsCursor(command, displaySize[0] + offsetX, displaySize[1] + offsetY,
+            row, col, cellWidth, cellHeight);
+        final boolean storeCopy = storeRequested;
+        final KittyImageStore.Entry reservation = storeRequested ? store.get(effectiveId) : null;
+        final LayerStep step = holdLayerPlace();
+
+        decoder.execute(() -> {
+            Bitmap decodedBitmap = null;
+            String error = null;
+            try {
+                decodeCount++;
+                decodedBitmap = (decodeForTests != null ? decodeForTests : producer).produce();
+                if (decodedBitmap == null) {
+                    error = "EINVAL:image decode failed";
+                } else if (decodedBitmap.getAllocationByteCount() > MAX_DECODED_BYTES) {
+                    decodedBitmap.recycle();
+                    decodedBitmap = null;
+                    error = "ENOSPC:decoded image exceeds session limit";
+                }
+            } catch (IllegalArgumentException e) {
+                error = "EINVAL:" + printable(e.getMessage());
+                if (decodedBitmap != null) decodedBitmap.recycle();
+                decodedBitmap = null;
+            } catch (RuntimeException | OutOfMemoryError e) {
+                error = "ENOMEM:image decode failed";
+                if (decodedBitmap != null) decodedBitmap.recycle();
+                decodedBitmap = null;
+            }
+            // The decode is the only pixel work: the placement draws this very bitmap, scaled and
+            // offset by the renderer, so there is no display-sized copy to make and nothing to
+            // composite. Stored or not, it is one bitmap.
+            final Bitmap decoded = decodedBitmap;
+            final String decodeError = error;
+            output.postTerminalUpdate(() -> {
+                decodeBytesInFlight = Math.max(0, decodeBytesInFlight - transmittedBytes);
+                land(step, () -> {
+                    if (decodeError != null) {
+                        if (storeCopy && store.get(effectiveId) == reservation) store.abandon(effectiveId);
+                        if (acceptedGeneration == generation)
+                            reply(command, decodeError, true, false, effectiveId);
+                        return;
+                    }
+                    long bytes = decoded.getAllocationByteCount();
+                    // Completed regardless of screen generation: the store is not screen state. A
+                    // delete that raced the decode leaves the placement owning the pixels instead,
+                    // and so does a later transmission under the same id: its reservation waits
+                    // for its own pixels, not for this frame's.
+                    boolean shared = storeCopy && store.get(effectiveId) == reservation
+                        && store.complete(effectiveId, decoded, (int) bytes);
+                    if (acceptedGeneration != generation) {
+                        if (!shared) decoded.recycle();
+                        return;
+                    }
+                    int anchorRow = row - (int) (emulator.scrollEventCount() - scrollsAtSubmit);
+                    if (!emulator.placeKittyGraphics(decoded, !shared, estimatedBytes(sourceWidth, sourceHeight, bytes),
+                        command, effectiveId, anchorRow, col, new int[] { 0, 0, sourceWidth, sourceHeight },
+                        displaySize[0], displaySize[1], offsetX, offsetY, cellWidth, cellHeight)) {
+                        if (!shared) decoded.recycle();
+                        reply(command, "EINVAL:image placement failed", true, false, effectiveId);
+                        return;
+                    }
+                    markPlaced(effectiveId);
+                    reply(command, "OK", false, false, effectiveId);
+                });
+            });
+        });
+    }
+
+    /** Bytes a decoded bitmap costs; the JVM's stub bitmaps report 0, so fall back to w*h*4. */
+    private static long estimatedBytes(int width, int height, long reported) {
+        return reported > 0 ? reported : (long) width * height * 4L;
+    }
+
+    /**
+     * A placement of a stored image ({@code a=p}). Resolution and cursor movement are synchronous
+     * against the store's reservation metadata. The placement itself is a rectangle over the
+     * store's bitmap — no pixel is touched — and lands synchronously when nothing earlier is still
+     * on the decode worker; otherwise it is bounced through the worker and back so it lands
+     * strictly after the referenced transmission's own completion, which is what makes
+     * back-to-back {@code a=t} then {@code a=p} from real clients safe with an asynchronous decoder.
+     * While bounced it holds its place in {@link #layerSteps}, so a later delete waits for it; one
+     * that needs no bounce still lands in stream order, through {@link #changeLayer}.
+     */
+    private void handlePlacement(Command command) {
+        final long id = store.resolveId(command.imageId, command.number);
+        KittyImageStore.Entry entry = id == 0 ? null : store.get(id);
+        if (entry == null) {
+            reply(command, "ENOENT:image not found", true, false);
+            return;
+        }
+        if (command.placeholder == 1) {
+            KittyImageStore.VirtualPlacement placement = createVirtualPlacement(command,
+                entry.width, entry.height);
+            if (placement == null) {
+                reply(command, "EINVAL:invalid unicode placement", true, false, id);
+                return;
+            }
+            store.putVirtualPlacement(entry, placement);
+            markPlaced(id);
+            reply(command, "OK", false, false, id);
+            return;
+        } else if (command.placeholder != 0) {
+            reply(command, "EINVAL:unsupported unicode placeholder mode", true, false, id);
+            return;
+        }
+        final int[] crop = computeCrop(entry.width, entry.height,
+            command.srcX, command.srcY, command.srcW, command.srcH);
+        if (crop == null) {
+            reply(command, "EINVAL:invalid source rectangle", true, false, id);
+            return;
+        }
+        final int cellWidth = Math.max(1, emulator.getCellWidthPixels());
+        final int cellHeight = Math.max(1, emulator.getCellHeightPixels());
+        if (command.cellOffsetX < 0 || command.cellOffsetX >= cellWidth
+            || command.cellOffsetY < 0 || command.cellOffsetY >= cellHeight) {
+            reply(command, "EINVAL:cell offset outside cell", true, false, id);
+            return;
+        }
+        final int offsetX = command.cellOffsetX;
+        final int offsetY = command.cellOffsetY;
+        final int[] displaySize = displaySize(command, crop[2], crop[3], cellWidth, cellHeight);
+        if ((long) (displaySize[0] + offsetX) * (displaySize[1] + offsetY) * 4L > MAX_DECODED_BYTES) {
+            reply(command, "ENOSPC:display image exceeds session limit", true, false, id);
+            return;
+        }
+        final long acceptedGeneration = generation;
+        final int row = emulator.getCursorRow();
+        final int col = emulator.getCursorCol();
+        // Same anchor discipline as submitDecode: the advance may scroll now, the placement lands
+        // later, and the captured screen row has to follow the content it was captured against.
+        final long scrollsAtSubmit = emulator.scrollEventCount();
+        emulator.advanceKittyGraphicsCursor(command, displaySize[0] + offsetX, displaySize[1] + offsetY,
+            row, col, cellWidth, cellHeight);
+
+        final Runnable place = () -> {
+            KittyImageStore.Entry ready = store.get(id);
+            if (ready == null || ready.bitmap == null) {
+                if (acceptedGeneration == generation)
+                    reply(command, "ENOENT:image not found", true, false, id);
+                return;
+            }
+            if (acceptedGeneration != generation) return;
+            // An animated image places its current frame, so a client-driven animation's new
+            // placements agree with what a=a,c=N selected; a still-decoding frame falls back to root.
+            Bitmap currentFrame = KittyImageStore.frameBitmap(ready, ready.currentFrame + 1);
+            final Bitmap source = currentFrame != null ? currentFrame : ready.bitmap;
+            int anchorRow = row - (int) (emulator.scrollEventCount() - scrollsAtSubmit);
+            // The store's own bitmap, shared: a re-placement moves a rectangle, it never copies.
+            if (!emulator.placeKittyGraphics(source, false, 0, command, id, anchorRow, col, crop,
+                displaySize[0], displaySize[1], offsetX, offsetY, cellWidth, cellHeight)) {
+                reply(command, "EINVAL:image placement failed", true, false, id);
+                return;
+            }
+            markPlaced(id);
+            reply(command, "OK", false, false, id);
+        };
+        KittyImageStore.Entry now = store.get(id);
+        if (now != null && now.bitmap != null && decodeBytesInFlight == 0) {
+            // Nothing earlier in the stream is still decoding, so the pixels are here: the
+            // placement lands now, behind what the queue already holds, or with the rest of the
+            // synchronized update (mode 2026) that carried it, so a moving picture never shows a
+            // frame of the move half done.
+            changeLayer(place);
+            return;
+        }
+        // Otherwise wait behind whatever is on the worker (the transmission this refers to above
+        // all), then place on the update thread, in the order the commands arrived.
+        final LayerStep step = holdLayerPlace();
+        decoder.execute(() -> output.postTerminalUpdate(() -> land(step, place)));
+    }
+
+    private static KittyImageStore.VirtualPlacement createVirtualPlacement(Command command,
+                                                                            int imageWidth,
+                                                                            int imageHeight) {
+        int[] crop = computeCrop(imageWidth, imageHeight, command.srcX, command.srcY,
+            command.srcW, command.srcH);
+        if (crop == null || command.displayColumns < 0 || command.displayRows < 0) return null;
+        return new KittyImageStore.VirtualPlacement(command.placementId, crop[0], crop[1],
+            crop[2], crop[3], command.displayColumns, command.displayRows);
+    }
+
+    /** The image store, for tests in this package that need an image without decoding one. */
+    KittyImageStore store() {
+        return store;
+    }
+
+    /** Fill a reusable renderer result for a Unicode-placeholder cell. */
+    boolean getPlaceholder(long imageId, long placementId, KittyImagePlaceholder out) {
+        KittyImageStore.Entry entry = store.get(imageId);
+        if (entry == null || out == null) return false;
+        KittyImageStore.VirtualPlacement placement = KittyImageStore.virtualPlacement(entry, placementId);
+        Bitmap bitmap = KittyImageStore.frameBitmap(entry, entry.currentFrame + 1);
+        if (bitmap == null && entry.standIn != null) {
+            // A retransmission still decoding: draw the picture it replaces, through the
+            // placements that picture was drawn with, until its own pixels land.
+            placement = KittyImageStore.virtualPlacement(entry.standIn.placements, placementId);
+            bitmap = entry.standIn.bitmap;
+        }
+        if (placement == null || bitmap == null) return false;
+        // The renderer is about to draw this image through a placeholder cell, which is the only
+        // moment a virtually-placed image is provably on a screen. Marking it here rather than at
+        // transmission is what keeps the sweep off an animation that is still loading: frames
+        // arrive before the shell has printed the placeholder grid that will display them.
+        entry.everPlaced = true;
+        out.bitmap = bitmap;
+        out.sourceX = placement.sourceX;
+        out.sourceY = placement.sourceY;
+        out.sourceWidth = placement.sourceWidth;
+        out.sourceHeight = placement.sourceHeight;
+        out.columns = placement.columns;
+        out.rows = placement.rows;
+        out.generation = entry.pixelGeneration;
+        return true;
+    }
+
+    /** The pixel generation of a stored image, 0 when there is none; see {@link #getPlaceholder}. */
+    long imageGeneration(long imageId) {
+        return store.generationOf(imageId);
+    }
+
+    boolean hasVirtualPlacement(long imageId, long placementId) {
+        KittyImageStore.Entry entry = store.get(imageId);
+        return entry != null && KittyImageStore.virtualPlacement(entry, placementId) != null;
+    }
+
+    /**
+     * Frame data transmission ({@code a=f}): decode off-thread, resolve the base canvas on the
+     * update thread strictly after earlier decodes have landed, compose off-thread, commit. The
+     * canvas is a previous frame's pixels ({@code c=}), the frame being edited ({@code r=}), or a
+     * solid {@code Y=} colour; {@code X=1} replaces instead of alpha blending, and {@code z} is
+     * the frame gap (positive milliseconds, negative gapless, absent defaults to 40 ms).
+     */
+    private void submitFrame(Command command, byte[] data) {
+        final long id = store.resolveId(command.imageId, command.number);
+        KittyImageStore.Entry initial = id == 0 ? null : store.get(id);
+        if (initial == null) {
+            reply(command, "ENOENT:image not found", true, false);
+            return;
+        }
+        // r selects an existing frame to edit; anything else appends a new frame, as kitty does.
+        final int frameCountAtAccept = KittyImageStore.frameCount(initial);
+        final int editNumber = (command.displayRows >= 1 && command.displayRows <= frameCountAtAccept)
+            ? command.displayRows : 0;
+        // Only the count is decided here. The byte quota is settled at commit, where the pixels are
+        // actually allocated and where a full quota can thin this animation instead of refusing the
+        // rest of it — a queued frame holds nothing but its compressed payload, which
+        // MAX_TRANSMITTED_BYTES already bounds.
+        if (editNumber == 0 && store.wouldExceedFrameCount(initial)) {
+            reply(command, "ENOSPC:frame store is full", true, false, id);
+            return;
+        }
+        if (decodeBytesInFlight + data.length > MAX_TRANSMITTED_BYTES) {
+            reply(command, "ENOSPC:too much image data pending", true, false, id);
+            return;
+        }
+        // The gate above passed, so this frame now owns that slice of the quota until it commits
+        // or fails. Every return below releases it exactly once; an edit replaces pixels in place
+        // and so costs nothing new.
+        final boolean reservedFrame = editNumber == 0;
+        if (reservedFrame) store.reserveFrame(initial);
+        final int transmittedBytes = data.length;
+        decodeBytesInFlight += transmittedBytes;
+
+        decoder.execute(() -> {
+            int[] pixels = null;
+            int pixelsWidth = 0;
+            int pixelsHeight = 0;
+            String error = null;
+            try {
+                if (command.format == 100) {
+                    BitmapFactory.Options options = new BitmapFactory.Options();
+                    options.inPreferredConfig = Bitmap.Config.ARGB_8888;
+                    Bitmap decoded = BitmapFactory.decodeByteArray(data, 0, data.length, options);
+                    if (decoded == null) throw new IllegalArgumentException("PNG decode failed");
+                    pixelsWidth = decoded.getWidth();
+                    pixelsHeight = decoded.getHeight();
+                    pixels = new int[pixelsWidth * pixelsHeight];
+                    decoded.getPixels(pixels, 0, pixelsWidth, 0, 0, pixelsWidth, pixelsHeight);
+                    decoded.recycle();
+                } else {
+                    byte[] raw = command.compression == 'z'
+                        ? inflate(data, (long) command.width * command.height * (command.format / 8))
+                        : data;
+                    pixels = rawPixelsToArgb(raw, command.width, command.height, command.format);
+                    pixelsWidth = command.width;
+                    pixelsHeight = command.height;
+                }
+            } catch (IllegalArgumentException e) {
+                error = "EINVAL:" + printable(e.getMessage());
+            } catch (RuntimeException | OutOfMemoryError e) {
+                error = "ENOMEM:frame decode failed";
+            }
+            final int[] framePixels = pixels;
+            final int frameWidth = pixelsWidth;
+            final int frameHeight = pixelsHeight;
+            final String decodeError = error;
+            output.postTerminalUpdate(() -> {
+                decodeBytesInFlight = Math.max(0, decodeBytesInFlight - transmittedBytes);
+                KittyImageStore.Entry entry = store.get(id);
+                if (decodeError != null || entry == null) {
+                    if (reservedFrame) store.releaseFrame(initial);
+                    reply(command, decodeError != null ? decodeError : "ENOENT:image not found",
+                        true, false, id);
+                    return;
+                }
+                if (!frameRectFits(entry, command.srcX, command.srcY, frameWidth, frameHeight)) {
+                    if (reservedFrame) store.releaseFrame(initial);
+                    reply(command, "EINVAL:frame rectangle out of bounds", true, false, id);
+                    return;
+                }
+                int frameCount = KittyImageStore.frameCount(entry);
+                final int targetNumber = (editNumber >= 1 && editNumber <= frameCount) ? editNumber : 0;
+                Bitmap base = null;
+                if (targetNumber != 0) {
+                    base = KittyImageStore.frameBitmap(entry, targetNumber);
+                } else if (command.displayColumns >= 1 && command.displayColumns <= frameCount) {
+                    base = KittyImageStore.frameBitmap(entry, command.displayColumns);
+                }
+                if ((targetNumber != 0 || (command.displayColumns >= 1 && command.displayColumns <= frameCount))
+                    && base == null) {
+                    if (reservedFrame) store.releaseFrame(initial);
+                    reply(command, "ENOENT:base frame data unavailable", true, false, id);
+                    return;
+                }
+                final Bitmap canvasSource = base;
+                final long backgroundColor = command.values.containsKey('Y')
+                    ? Command.unsigned(command.values, 'Y') : 0;
+                final int imageWidth = entry.width;
+                final int imageHeight = entry.height;
+                decoder.execute(() -> {
+                    Bitmap composed = null;
+                    String composeError = null;
+                    try {
+                        int[] canvas = new int[imageWidth * imageHeight];
+                        if (canvasSource != null) {
+                            canvasSource.getPixels(canvas, 0, imageWidth, 0, 0, imageWidth, imageHeight);
+                        } else if (backgroundColor != 0) {
+                            // The protocol's Y is 32-bit RGBA; ARGB ints are what Bitmap takes.
+                            int rgba = (int) backgroundColor;
+                            int argb = (rgba << 24) | (rgba >>> 8);
+                            java.util.Arrays.fill(canvas, argb);
+                        }
+                        composeRegion(canvas, imageWidth, framePixels, frameWidth,
+                            frameWidth, frameHeight, 0, 0, command.srcX, command.srcY,
+                            command.cellOffsetX == 1);
+                        composed = Bitmap.createBitmap(canvas, imageWidth, imageHeight,
+                            Bitmap.Config.ARGB_8888);
+                        if (composed == null) throw new OutOfMemoryError("frame compose failed");
+                    } catch (IllegalArgumentException e) {
+                        composeError = "EINVAL:" + printable(e.getMessage());
+                    } catch (RuntimeException | OutOfMemoryError e) {
+                        composeError = "ENOMEM:frame compose failed";
+                    }
+                    final Bitmap frameBitmap = composed;
+                    final String finalError = composeError;
+                    output.postTerminalUpdate(() -> {
+                        // From here the frame either takes its bytes for real or takes none, so
+                        // the reservation has done its job either way.
+                        if (reservedFrame) store.releaseFrame(initial);
+                        KittyImageStore.Entry live = store.get(id);
+                        if (finalError != null || live != entry) {
+                            reply(command, finalError != null ? finalError : "ENOENT:image not found",
+                                true, false, id);
+                            return;
+                        }
+                        int byteCount = imageWidth * imageHeight * 4;
+                        if (targetNumber != 0) {
+                            store.replaceFrameBitmap(entry, targetNumber, frameBitmap, byteCount);
+                            if (command.z != 0)
+                                KittyImageStore.setFrameGap(entry, targetNumber, Math.max(0, command.z));
+                            // Inside a posted update, which notifies the client on its own.
+                            if (targetNumber == entry.currentFrame + 1) renderAnimationFrame(entry);
+                        } else {
+                            int gap = command.z > 0 ? command.z
+                                : command.z < 0 ? 0 : KittyImageStore.DEFAULT_FRAME_GAP_MS;
+                            if (!store.makeRoomForFrame(entry, byteCount,
+                                    imageId -> !emulator.kittyPlacementsFor(imageId).isEmpty())) {
+                                reply(command, "ENOSPC:frame store is full", true, false, id);
+                                return;
+                            }
+                            store.addFrame(entry, frameBitmap, byteCount, gap);
+                        }
+                        reply(command, "OK", false, false, id);
+                        scheduleAnimationTick();
+                    });
+                });
+            });
+        });
+    }
+
+    /**
+     * Animation control ({@code a=a}): all synchronous state. Matching kitty, a successful
+     * control produces no reply; only a missing image answers.
+     */
+    private void handleAnimationControl(Command command) {
+        KittyImageStore.Entry entry = store.get(store.resolveId(command.imageId, command.number));
+        if (entry == null) {
+            reply(command, "ENOENT:image not found", true, false);
+            return;
+        }
+        int frameCount = KittyImageStore.frameCount(entry);
+        // r + z set one frame's gap; out-of-range frame numbers are ignored, as kitty ignores them.
+        if (command.displayRows >= 1 && command.displayRows <= frameCount && command.z != 0)
+            KittyImageStore.setFrameGap(entry, command.displayRows, Math.max(0, command.z));
+        // c makes a frame current — the client-driven animation primitive.
+        if (command.displayColumns >= 1 && command.displayColumns <= frameCount
+            && command.displayColumns - 1 != entry.currentFrame) {
+            entry.currentFrame = command.displayColumns - 1;
+            entry.frameShownAtUptime = SystemClock.uptimeMillis();
+            KittyImageStore.notePixelsChanged(entry);
+            // The client asked for this frame in the escape stream, which notifies on its own.
+            renderAnimationFrame(entry);
+        }
+        String state = command.values.get('s');
+        if (state != null) {
+            int previous = entry.animationState;
+            int requested = Command.integer(command.values, 's', 0);
+            if (requested >= 1 && requested <= 3) entry.animationState = requested;
+            if (entry.animationState != KittyImageStore.ANIMATION_STOPPED
+                && previous != entry.animationState) {
+                entry.frameShownAtUptime = SystemClock.uptimeMillis();
+            }
+            entry.currentLoop = 0;
+        }
+        // v=1 loops forever; any larger v runs v-1 loops, kitty's exact reading.
+        int loops = Command.integer(command.values, 'v', 0);
+        if (loops > 0) entry.maxLoops = loops - 1;
+        scheduleAnimationTick();
+    }
+
+    /** Frame composition ({@code a=c}): copy or blend a rectangle from one frame onto another. */
+    private void handleCompose(Command command) {
+        final long id = store.resolveId(command.imageId, command.number);
+        final KittyImageStore.Entry entry = id == 0 ? null : store.get(id);
+        if (entry == null) {
+            reply(command, "ENOENT:image not found", true, false);
+            return;
+        }
+        int frameCount = KittyImageStore.frameCount(entry);
+        // r is the source frame and c the destination; x,y offset the destination rectangle and
+        // X,Y the source one — kitty's implementation, which its own spec prose has backwards.
+        final int sourceNumber = command.displayRows;
+        final int destinationNumber = command.displayColumns;
+        if (sourceNumber < 1 || sourceNumber > frameCount
+            || destinationNumber < 1 || destinationNumber > frameCount) {
+            reply(command, "ENOENT:no such frame", true, false, id);
+            return;
+        }
+        final int width = command.srcW > 0 ? command.srcW : entry.width;
+        final int height = command.srcH > 0 ? command.srcH : entry.height;
+        final int srcX = command.cellOffsetX;
+        final int srcY = command.cellOffsetY;
+        final int dstX = command.srcX;
+        final int dstY = command.srcY;
+        if (!frameRectFits(entry, srcX, srcY, width, height)
+            || !frameRectFits(entry, dstX, dstY, width, height)) {
+            reply(command, "EINVAL:rectangle out of bounds", true, false, id);
+            return;
+        }
+        if (sourceNumber == destinationNumber
+            && Math.max(srcX, dstX) < Math.min(srcX, dstX) + width
+            && Math.max(srcY, dstY) < Math.min(srcY, dstY) + height) {
+            reply(command, "EINVAL:source and destination rectangles overlap", true, false, id);
+            return;
+        }
+        final boolean replace = command.noCursorMovement; // C=1 means replace in a=c
+        final int imageWidth = entry.width;
+        final int imageHeight = entry.height;
+
+        decoder.execute(() -> output.postTerminalUpdate(() -> {
+            KittyImageStore.Entry live = store.get(id);
+            if (live != entry) {
+                reply(command, "ENOENT:image not found", true, false, id);
+                return;
+            }
+            final Bitmap source = KittyImageStore.frameBitmap(entry, sourceNumber);
+            final Bitmap destination = KittyImageStore.frameBitmap(entry, destinationNumber);
+            if (source == null || destination == null) {
+                reply(command, "EINVAL:frame data unavailable", true, false, id);
+                return;
+            }
+            decoder.execute(() -> {
+                Bitmap composed = null;
+                String error = null;
+                try {
+                    int[] under = new int[imageWidth * imageHeight];
+                    destination.getPixels(under, 0, imageWidth, 0, 0, imageWidth, imageHeight);
+                    int[] over = new int[imageWidth * imageHeight];
+                    source.getPixels(over, 0, imageWidth, 0, 0, imageWidth, imageHeight);
+                    composeRegion(under, imageWidth, over, imageWidth,
+                        width, height, srcX, srcY, dstX, dstY, replace);
+                    composed = Bitmap.createBitmap(under, imageWidth, imageHeight,
+                        Bitmap.Config.ARGB_8888);
+                    if (composed == null) throw new OutOfMemoryError("compose failed");
+                } catch (RuntimeException | OutOfMemoryError e) {
+                    error = "ENOMEM:frame compose failed";
+                }
+                final Bitmap result = composed;
+                final String composeError = error;
+                output.postTerminalUpdate(() -> {
+                    KittyImageStore.Entry still = store.get(id);
+                    if (composeError != null || still != entry) {
+                        reply(command, composeError != null ? composeError : "ENOENT:image not found",
+                            true, false, id);
+                        return;
+                    }
+                    store.replaceFrameBitmap(entry, destinationNumber, result,
+                        imageWidth * imageHeight * 4);
+                    if (destinationNumber == entry.currentFrame + 1) renderAnimationFrame(entry);
+                    reply(command, "OK", false, false, id);
+                });
+            });
+        }));
+    }
+
+    // ------------------------------------------------------------------ terminal-driven playback
+
+    private boolean animationTickScheduled;
+    /**
+     * Whether this terminal is on screen. Playback is suspended, never discarded, while it is not:
+     * an animation that scrolled out of view or whose pane went away keeps every frame and its
+     * place in them, and picks up where it would have been when it comes back.
+     */
+    private boolean animationsVisible = true;
+    /**
+     * One runnable for the life of the protocol. It is the token the scheduled tick is posted
+     * under, so the tick can be withdrawn — and re-posting a new lambda every frame allocated a
+     * pair of objects per tick for nothing.
+     */
+    private final Runnable animationTickRunnable = this::animationTick;
+
+    /**
+     * Report whether this terminal's output can be seen. Suspending stops the tick outright: the
+     * scheduler has no notion of what is on display, so an off-screen animation otherwise keeps
+     * flipping frames — and compositing them — for as long as the process lives.
+     */
+    void setAnimationsVisible(boolean visible) {
+        if (animationsVisible == visible) return;
+        animationsVisible = visible;
+        if (visible) {
+            resumeAnimations();
+        } else {
+            cancelAnimationTick();
+        }
+    }
+
+    private void cancelAnimationTick() {
+        if (!animationTickScheduled) return;
+        animationTickScheduled = false;
+        output.cancelTerminalUpdateDelayed(animationTickRunnable);
+    }
+
+    /** Fast-forward every animation to where it would have been, composite once, and resume. */
+    private void resumeAnimations() {
+        long now = SystemClock.uptimeMillis();
+        boolean redraw = false;
+        for (KittyImageStore.Entry entry : store.entries()) {
+            if (KittyImageStore.catchUpAnimation(entry, now) && !renderAnimationFrame(entry))
+                redraw = true;
+        }
+        if (redraw) output.onScreenChanged();
+        scheduleAnimationTick();
+    }
+
+    /** Arm one delayed tick for the earliest due frame across all running animations. */
+    private void scheduleAnimationTick() {
+        if (animationTickScheduled || !animationsVisible) return;
+        long earliest = Long.MAX_VALUE;
+        for (KittyImageStore.Entry entry : store.entries()) {
+            long deadline = KittyImageStore.nextAnimationDeadline(entry);
+            if (deadline >= 0 && deadline < earliest) earliest = deadline;
+        }
+        if (earliest == Long.MAX_VALUE) return;
+        long delay = Math.min(60_000, Math.max(1, earliest - SystemClock.uptimeMillis()));
+        animationTickScheduled = true;
+        output.postTerminalUpdateDelayed(animationTickRunnable, delay);
+    }
+
+    private void animationTick() {
+        animationTickScheduled = false;
+        long now = SystemClock.uptimeMillis();
+        boolean redraw = false;
+        // Asked at most once a tick, and only when a placeholder-displayed animation flipped.
+        Boolean placeholderCellsOnScreen = null;
+        for (KittyImageStore.Entry entry : store.entries()) {
+            // The frame index advances whether or not anything can see it — that is what keeps a
+            // scrolled-away animation in step, and keeps the scheduler from finding a deadline
+            // permanently in the past and spinning on it. Only showing the frame, which is the
+            // expensive half, waits until there is a cell on screen to show it in.
+            if (!KittyImageStore.advanceAnimation(entry, now)) continue;
+            boolean onScreen = emulator.isKittyImageOnScreen(entry.id);
+            if (!onScreen && !entry.virtualPlacements.isEmpty()) {
+                if (placeholderCellsOnScreen == null)
+                    placeholderCellsOnScreen = emulator.isAnyKittyPlaceholderCellOnScreen();
+                onScreen = placeholderCellsOnScreen;
+            }
+            if (!onScreen) continue;
+            // Placements and Unicode placeholders both draw straight out of the store, so the flip
+            // is the whole change and a redraw shows it.
+            if (!renderAnimationFrame(entry)) redraw = true;
+        }
+        // At most one redraw request per tick, and none for a tick that only moved a scrolled-away
+        // animation along or that re-composited placements. The tick is armed at the earliest frame
+        // deadline across every animation, so what reaches the view is one redraw per frame the
+        // user can actually see change.
+        if (redraw) output.onScreenChanged();
+        scheduleAnimationTick();
+    }
+
+    /**
+     * Release everything this protocol holds when its session is over: the pending tick first,
+     * because it is posted on the main looper and reaches the whole terminal through this object,
+     * then the stored pixels. Nothing else can be reading them once the session is finished, so
+     * the bitmaps are recycled rather than left to the collector.
+     */
+    void shutdown() {
+        cancelAnimationTick();
+        upload = null;
+        layerSteps.clear();
+        window = null;
+        windowGraceDeadline = 0;
+        for (KittyImageStore.Entry entry : store.entries()) {
+            if (entry.bitmap != null && !entry.bitmap.isRecycled()) entry.bitmap.recycle();
+            Bitmap standIn = entry.standIn == null ? null : entry.standIn.bitmap;
+            if (standIn != null && !standIn.isRecycled()) standIn.recycle();
+            for (KittyImageStore.Frame frame : entry.frames) {
+                if (frame.bitmap != null && !frame.bitmap.isRecycled()) frame.bitmap.recycle();
+            }
+        }
+        store.clear();
+    }
+
+    /**
+     * Drop the frames of every animation nothing can display any more, keeping the root image so a
+     * later {@code a=p} still works — kitty's behaviour, and what makes a {@code clear} actually
+     * hand the memory back. Only images that have been placed at least once are in scope: one that
+     * is still being transmitted has no placement yet and must keep the frames it is collecting.
+     */
+    void dropFramesOfUnreachableImages() {
+        // The placeholder scan walks the whole transcript, so it is only worth asking when there
+        // is an animation placed that way with frames still to reclaim — and then only once.
+        Boolean placeholderCellsRemain = null;
+        for (KittyImageStore.Entry entry : store.entries()) {
+            if (entry.frames.isEmpty() || !entry.everPlaced) continue;
+            if (!entry.virtualPlacements.isEmpty()) {
+                if (placeholderCellsRemain == null)
+                    placeholderCellsRemain = emulator.hasAnyKittyPlaceholderCell();
+                if (placeholderCellsRemain) continue;
+            } else if (!emulator.kittyPlacementsFor(entry.id).isEmpty()) {
+                continue;
+            }
+            store.dropFrames(entry);
+        }
+        cancelAnimationTickIfNothingAnimates();
+    }
+
+    /**
+     * Give up every animation, keeping the still image each one rests on. Frames are the one thing
+     * a terminal holds that it can lose without losing content: a logo stops moving where deleting
+     * the image would leave blank cells, and being killed would lose the session. Unlike the
+     * visibility gate this is not reversible — the sender has long exited and cannot retransmit —
+     * so it belongs to real memory pressure and nothing less.
+     */
+    void dropAllAnimationFrames() {
+        for (KittyImageStore.Entry entry : store.entries()) {
+            if (entry.frames.isEmpty()) continue;
+            store.dropFrames(entry);
+            // Placements point at the frame they last showed; move them back to the still image
+            // so the dropped frame's pixels can actually be collected.
+            renderAnimationFrame(entry);
+        }
+        cancelAnimationTick();
+    }
+
+    private void markPlaced(long imageId) {
+        KittyImageStore.Entry entry = store.get(imageId);
+        if (entry != null) entry.everPlaced = true;
+    }
+
+    private void cancelAnimationTickIfNothingAnimates() {
+        for (KittyImageStore.Entry entry : store.entries()) {
+            if (KittyImageStore.nextAnimationDeadline(entry) >= 0) return;
+        }
+        cancelAnimationTick();
+    }
+
+    /**
+     * Show this image's current frame in every placement of it. A placement draws straight from a
+     * bitmap the store owns, so a flip is pointing each placement at the frame's bitmap and telling
+     * the renderer — nothing is drawn off-thread, nothing is allocated, and the cells never move,
+     * so a flip cannot flicker.
+     *
+     * @return false always: the caller asks for the redraw, which is the whole of the change.
+     */
+    private boolean renderAnimationFrame(KittyImageStore.Entry entry) {
+        Bitmap frame = KittyImageStore.frameBitmap(entry, entry.currentFrame + 1);
+        if (frame == null) frame = entry.bitmap;
+        if (frame == null) return false;
+        boolean changed = false;
+        for (KittyPlacement placement : emulator.kittyPlacementsFor(entry.id)) {
+            if (placement.ownsBitmap || placement.bitmap == frame) continue;
+            placement.bitmap = frame;
+            changed = true;
+        }
+        if (changed) emulator.noteKittyPlacementPixelsReplaced();
+        return false;
+    }
+
+    /**
+     * Compose a {@code w*h} rectangle of {@code over} at source offset {@code (ox,oy)} onto
+     * {@code under} at {@code (dx,dy)}. Both are row-major, non-premultiplied ARGB. Straight-alpha
+     * source-over unless {@code replace}. Bounds must already be validated.
+     */
+    static void composeRegion(int[] under, int underWidth, int[] over, int overWidth,
+                              int w, int h, int ox, int oy, int dx, int dy, boolean replace) {
+        for (int row = 0; row < h; row++) {
+            int src = (oy + row) * overWidth + ox;
+            int dst = (dy + row) * underWidth + dx;
+            for (int col = 0; col < w; col++, src++, dst++) {
+                int overPixel = over[src];
+                int overAlpha = overPixel >>> 24;
+                if (replace || overAlpha == 0xff) {
+                    under[dst] = overPixel;
+                    continue;
+                }
+                if (overAlpha == 0) continue;
+                int underPixel = under[dst];
+                int underAlpha = underPixel >>> 24;
+                int contribution = underAlpha * (255 - overAlpha) / 255;
+                int outAlpha = overAlpha + contribution;
+                if (outAlpha == 0) {
+                    under[dst] = 0;
+                    continue;
+                }
+                int r = (((overPixel >> 16) & 0xff) * overAlpha
+                    + ((underPixel >> 16) & 0xff) * contribution) / outAlpha;
+                int g = (((overPixel >> 8) & 0xff) * overAlpha
+                    + ((underPixel >> 8) & 0xff) * contribution) / outAlpha;
+                int b = ((overPixel & 0xff) * overAlpha
+                    + (underPixel & 0xff) * contribution) / outAlpha;
+                under[dst] = (outAlpha << 24) | (r << 16) | (g << 8) | b;
+            }
+        }
+    }
+
+    /**
+     * The delete forms ({@code a=d}). An uppercase specifier also frees the targeted stored data.
+     * Validation, the reply and the store's own side run here, in stream order. Taking placements
+     * off the layer goes through {@link #changeLayer}: immediate when nothing is on the worker,
+     * otherwise after the decodes ahead of it land and in the same update as them.
+     */
+    private void handleDelete(Command command) {
+        boolean free = Character.isUpperCase(command.deleteMode);
+        char form = Character.toLowerCase(command.deleteMode);
+        // The legacy fork behavior — and the least surprising reading for clients that send an id
+        // with the default specifier — is that d=a plus an explicit i/I deletes only that image.
+        if (form == 'a' && command.imageId != 0) form = 'i';
+        else if (form == 'a' && command.number != 0) form = 'n';
+        switch (form) {
+            case 'a':
+                changeLayer(() -> emulator.deleteKittyPlacements((placement, row) -> true, true));
+                if (free) store.removeImagesWithoutVirtualPlacements();
+                break;
+            case 'i':
+            case 'n': {
+                long id = form == 'n' ? store.resolveId(0, command.number)
+                    : store.resolveId(command.imageId, command.number);
+                if (form == 'n' && command.number == 0) {
+                    reply(command, "EINVAL:delete by number requires I", true, true);
+                    return;
+                }
+                if (form == 'i' && command.imageId == 0 && id == 0) {
+                    reply(command, "EINVAL:delete by id requires i", true, true);
+                    return;
+                }
+                if (id != 0) {
+                    KittyImageStore.Entry entry = store.get(id);
+                    if (entry != null) {
+                        if (command.placementId == 0 && emulator.isScreenUpdateHeld())
+                            store.holdPictureForReplacement(entry);
+                        KittyImageStore.removeVirtualPlacements(entry, command.placementId);
+                        store.releaseStandIn(entry);
+                    }
+                    changeLayer(() -> {
+                        emulator.deleteKittyPlacements((placement, row) ->
+                            placement.imageId == id
+                                && (command.placementId == 0 || placement.placementId == command.placementId), true);
+                        if (free) freeIfUnplaced(id, entry);
+                    });
+                }
+                break;
+            }
+            case 'c':
+                deleteAtCell(emulator.getCursorCol(), emulator.getCursorRow(), null, free);
+                break;
+            case 'f': {
+                long id = store.resolveId(command.imageId, command.number);
+                KittyImageStore.Entry entry = id == 0 ? null : store.get(id);
+                if (entry == null) {
+                    reply(command, "ENOENT:image not found", true, true);
+                    return;
+                }
+                int before = entry.currentFrame;
+                if (!store.removeFrame(entry, command.displayRows)) {
+                    // No extra frames: d=F deletes the whole image, d=f is a no-op — kitty's rule.
+                    if (free) {
+                        changeLayer(() -> emulator.deleteKittyPlacements((placement, row) ->
+                            placement.imageId == id, true));
+                        store.removeIfNoVirtualPlacements(id);
+                    }
+                } else if (entry.currentFrame != before) {
+                    renderAnimationFrame(entry);
+                }
+                break;
+            }
+            case 'p':
+            case 'q': {
+                if (!command.values.containsKey('x') || !command.values.containsKey('y')
+                    || (form == 'q' && !command.values.containsKey('z'))) {
+                    reply(command, "EINVAL:delete by position requires x and y", true, true);
+                    return;
+                }
+                deleteAtCell(command.srcX - 1, command.srcY - 1, form == 'q' ? command.z : null, free);
+                break;
+            }
+            case 'x': {
+                if (!command.values.containsKey('x')) {
+                    reply(command, "EINVAL:delete by column requires x", true, true);
+                    return;
+                }
+                int column = command.srcX - 1;
+                deleteMatching((placement, anchorRow) ->
+                    column >= placement.column && column < placement.column + placement.columns, false, free);
+                break;
+            }
+            case 'y': {
+                if (!command.values.containsKey('y')) {
+                    reply(command, "EINVAL:delete by row requires y", true, true);
+                    return;
+                }
+                int row = command.srcY - 1;
+                long scrolls = emulator.scrollEventCount();
+                deleteMatching((placement, anchorRow) -> {
+                    int target = row - scrolledSince(scrolls);
+                    return target >= anchorRow && target < anchorRow + placement.rows;
+                }, false, free);
+                break;
+            }
+            case 'z': {
+                if (!command.values.containsKey('z')) {
+                    reply(command, "EINVAL:delete by z requires z", true, true);
+                    return;
+                }
+                deleteMatching((placement, anchorRow) -> placement.z == command.z, true, free);
+                break;
+            }
+            default:
+                reply(command, "EINVAL:unknown delete specifier", true, true);
+                return;
+        }
+        reply(command, "OK", false, false);
+    }
+
+    /** Delete placements that cover one screen cell, optionally also matching a z value. */
+    private void deleteAtCell(int column, int row, Integer z, boolean free) {
+        long scrolls = emulator.scrollEventCount();
+        deleteMatching((placement, anchorRow) ->
+            placement.covers(column, row - scrolledSince(scrolls)) && (z == null || placement.z == z),
+            false, free);
+    }
+
+    /**
+     * Lines scrolled since {@code scrolls} was read. A delete by position names a screen row as it
+     * was when the command arrived; queued behind a decode, it has to follow the content the same
+     * way a placement's anchor does.
+     */
+    private int scrolledSince(long scrolls) {
+        return (int) (emulator.scrollEventCount() - scrolls);
+    }
+
+    /** Delete every placement the filter matches; the uppercase forms also free unplaced images. */
+    private void deleteMatching(TerminalBuffer.KittyPlacementFilter filter, boolean includeScrollback,
+                                boolean free) {
+        // Which image each id named when the command arrived: by the time a queued delete runs, a
+        // later transmission may have put a new image under one of the ids.
+        Map<Long, KittyImageStore.Entry> named = new HashMap<>();
+        if (free) {
+            for (KittyImageStore.Entry entry : store.entries()) named.put(entry.id, entry);
+        }
+        changeLayer(() -> {
+            List<KittyPlacement> deleted = emulator.deleteKittyPlacements(filter, includeScrollback);
+            if (!free) return;
+            for (KittyPlacement placement : deleted)
+                freeIfUnplaced(placement.imageId, named.get(placement.imageId));
+        });
+    }
+
+    /**
+     * Free a stored image once nothing displays it, unless it is no longer the image {@code named}:
+     * a queued delete must not free what a transmission after it in the stream has stored.
+     */
+    private void freeIfUnplaced(long id, @Nullable KittyImageStore.Entry named) {
+        if (store.get(id) == named && emulator.kittyPlacementsFor(id).isEmpty())
+            store.removeIfNoVirtualPlacements(id);
+    }
+
+    /**
+     * Apply a change to the placement layer now when nothing is queued ahead of it and no
+     * synchronized update is open; otherwise queue it in stream order.
+     */
+    private void changeLayer(Runnable change) {
+        LayerStep step = new LayerStep();
+        step.change = change;
+        if (!queueLayerStep(step, true)) change.run();
+    }
+
+    /** Hold a place in the layer queue for work that is about to go to the worker. */
+    private LayerStep holdLayerPlace() {
+        LayerStep step = new LayerStep();
+        queueLayerStep(step, false);
+        return step;
+    }
+
+    /**
+     * Put a step where it belongs: into the open synchronized update's batch, or behind whatever
+     * the queue holds. Returns false, queueing nothing, when {@code mayRunNow} and there is
+     * neither, so the caller can apply the change at once.
+     */
+    private boolean queueLayerStep(LayerStep step, boolean mayRunNow) {
+        // Asking is also what seals a window whose hold has run out, unless a picture it started
+        // is still arriving: then the window outlives the hold (see synchronizedHoldEnded).
+        if (emulator.isScreenUpdateHeld() || window != null) {
+            if (window == null) {
+                window = new LayerStep();
+                window.batch = new ArrayList<>();
+                layerSteps.add(window);
+                windowOpenedAt = System.currentTimeMillis();
+            }
+            window.batch.add(step);
+            return true;
+        }
+        if (mayRunNow && layerSteps.isEmpty()) return false;
+        layerSteps.add(step);
+        return true;
+    }
+
+    /**
+     * The synchronized update ended (reset, or its hold ran out): its batch is complete, and applies
+     * as soon as every decode in it has come back and everything ahead of it has applied — right
+     * now, when that is already so.
+     */
+    void endSynchronizedWindow() {
+        store.forgetHeldPictures();
+        windowGraceDeadline = 0;
+        if (window == null) return;
+        window.sealed = true;
+        window = null;
+        applyReadyLayerSteps();
+    }
+
+    /**
+     * The screen hold ended without the update ending: it ran out, or was cleared some other way.
+     * Text is released either way. But when a picture the update started is still arriving — a big
+     * uncompressed frame over a slow link takes longer than the hold allows — sealing now would
+     * apply the update's delete with the replacement nowhere near, and the screen would show no
+     * picture until it lands. So the window stays open for the rest of the update: until it ends,
+     * or {@link #windowUploadGraceMillis} after it opened, whichever is first. Until then the old
+     * picture stays on screen, never none.
+     */
+    void synchronizedHoldEnded() {
+        // The screen draws again from here, so a picture deleted under the hold has now been seen
+        // gone and must not come back as a stand-in.
+        store.forgetHeldPictures();
+        if (window == null) return;
+        if (windowGraceDeadline == 0) {
+            if (!streamOpen && upload == null) {
+                endSynchronizedWindow();
+                return;
+            }
+            windowGraceDeadline = windowOpenedAt + windowUploadGraceMillis;
+        }
+        if (System.currentTimeMillis() >= windowGraceDeadline) endSynchronizedWindow();
+    }
+
+    /**
+     * The worker's result for {@code step} is back on the update thread. Apply it together with
+     * every change queued behind it that is now unblocked, in order, all inside this one posted
+     * update, so the renderer sees them as one change. A step a reset let go of applies at once:
+     * its change checks the generation itself.
+     */
+    private void land(LayerStep step, Runnable change) {
+        step.change = change;
+        if (step.released) {
+            change.run();
+            return;
+        }
+        applyReadyLayerSteps();
+    }
+
+    private void applyReadyLayerSteps() {
+        while (!layerSteps.isEmpty() && layerSteps.peekFirst().isReady())
+            layerSteps.pollFirst().apply();
+    }
+
+    /**
+     * A reset, a screen switch or a clear is about to move the generation on. Whatever is queued
+     * was addressed to the screen as it is now, so the ready changes land now, in order, batches
+     * included; the steps still on the worker are let go and will see the new generation when they
+     * come back. An open synchronized update starts a fresh batch with its next change.
+     */
+    private void releaseLayerSteps() {
+        List<LayerStep> steps = new ArrayList<>(layerSteps);
+        layerSteps.clear();
+        store.forgetHeldPictures();
+        window = null;
+        windowGraceDeadline = 0;
+        for (LayerStep step : steps) {
+            for (LayerStep part : step.batch != null ? step.batch : Collections.singletonList(step)) {
+                if (part.change != null) {
+                    part.change.run();
+                } else {
+                    part.released = true;
+                }
+            }
+        }
+    }
+
+    void reset() {
+        resetUploadAndDecodes();
+        store.clear();
+        emulator.deleteAllKittyGraphics();
+    }
+
+    /**
+     * Move between the normal and alternate screens. This is not a reset: the two buffers own their
+     * own cells, so an image displayed on one is already invisible from the other, and the
+     * alternate buffer is blanked as it is entered. Destroying the store here took the images of
+     * whatever was on the normal screen with it — running anything full-screen, a multiplexer, an
+     * editor, a pager, left a hole where the logo above the prompt had been, and exiting did not
+     * bring it back because there was nothing left to bring back.
+     *
+     * <p>A chunked transmission is the one thing that must not survive: half an image addressed to
+     * the screen being left is not the start of an image on the screen being entered.</p>
+     */
+    void screenSwitched() {
+        resetUploadAndDecodes();
+    }
+
+    void screenCleared() {
+        resetUploadAndDecodes();
+        emulator.deleteVisibleKittyGraphics();
+    }
+
+    private void resetUploadAndDecodes() {
+        upload = null;
+        releaseLayerSteps();
+        generation++;
+    }
+
+    private void reply(Command command, String status, boolean error, boolean always) {
+        reply(command, status, error, always, command == null ? 0 : command.imageId);
+    }
+
+    /**
+     * The {@code imageId} may differ from the command's own when the terminal assigned one for an
+     * {@code I=}-only transmission; the client learns the assignment from this reply.
+     */
+    private void reply(Command command, String status, boolean error, boolean always, long imageId) {
+        int quiet = command == null ? 0 : command.quiet;
+        // q=1 suppresses success, q=2 suppresses everything. The old check compared q to 1 and 2
+        // exactly, so q=2 still emitted OK — which lands in the tty and, with no application reading
+        // it, corrupts the shell's input line.
+        if (!error && quiet >= 1) return;
+        if (error && quiet >= 2) return;
+        long number = command == null ? 0 : command.number;
+        if (!always && imageId == 0 && number == 0) return;
+        StringBuilder response = new StringBuilder("\033_G");
+        if (imageId != 0)
+            response.append("i=").append(Long.toUnsignedString(imageId));
+        if (number != 0) {
+            if (imageId != 0) response.append(',');
+            response.append("I=").append(Long.toUnsignedString(number));
+        }
+        if (command != null && command.placementId != 0)
+            response.append(",p=").append(Long.toUnsignedString(command.placementId));
+        response.append(';').append(status).append("\033\\");
+        output.write(response.toString());
+    }
+
+    /**
+     * Clamp a kitty source rectangle against the stored image, returning {x, y, width, height} or
+     * null when it selects nothing. Zero width or height means "to the edge".
+     */
+    static int[] computeCrop(int sourceWidth, int sourceHeight, int x, int y, int w, int h) {
+        if (x < 0 || y < 0 || w < 0 || h < 0) return null;
+        if (x >= sourceWidth || y >= sourceHeight) return null;
+        int cropWidth = w == 0 ? sourceWidth - x : Math.min(w, sourceWidth - x);
+        int cropHeight = h == 0 ? sourceHeight - y : Math.min(h, sourceHeight - y);
+        if (cropWidth <= 0 || cropHeight <= 0) return null;
+        return new int[] { x, y, cropWidth, cropHeight };
+    }
+
+    private static int[] pngDimensions(byte[] png) {
+        if (png.length < 24 || (png[0] & 0xff) != 0x89 || png[1] != 'P' || png[2] != 'N'
+            || png[3] != 'G' || png[4] != 13 || png[5] != 10 || png[6] != 26 || png[7] != 10
+            || png[12] != 'I' || png[13] != 'H' || png[14] != 'D' || png[15] != 'R') return null;
+        int width = readPositiveInt(png, 16);
+        int height = readPositiveInt(png, 20);
+        if (width <= 0 || height <= 0) return null;
+        return new int[] { width, height };
+    }
+
+    /** Small strict decoder kept here so protocol tests do not depend on Android framework stubs. */
+    private static byte[] decodeBase64(String encoded) {
+        ByteArrayOutputStream decoded = new ByteArrayOutputStream(encoded.length() * 3 / 4);
+        int accumulator = 0;
+        int bits = 0;
+        int useful = 0;
+        boolean padding = false;
+        for (int i = 0; i < encoded.length(); i++) {
+            char c = encoded.charAt(i);
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
+            if (c == '=') {
+                padding = true;
+                continue;
+            }
+            if (padding) throw new IllegalArgumentException("data after base64 padding");
+            int value = base64Value(c);
+            if (value < 0) throw new IllegalArgumentException("invalid base64 character");
+            accumulator = (accumulator << 6) | value;
+            bits += 6;
+            useful++;
+            if (bits >= 8) {
+                bits -= 8;
+                decoded.write((accumulator >> bits) & 0xff);
+            }
+        }
+        if ((useful & 3) == 1 || (bits > 0 && (accumulator & ((1 << bits) - 1)) != 0))
+            throw new IllegalArgumentException("invalid base64 length");
+        return decoded.toByteArray();
+    }
+
+    private static int base64Value(char c) {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    }
+
+    private static int[] displaySize(Command command, int sourceWidth, int sourceHeight,
+                                     int cellWidth, int cellHeight) {
+        long requestedWidth = command.displayColumns > 0 ? (long) command.displayColumns * cellWidth : 0;
+        long requestedHeight = command.displayRows > 0 ? (long) command.displayRows * cellHeight : 0;
+        if (requestedWidth > Integer.MAX_VALUE || requestedHeight > Integer.MAX_VALUE)
+            return new int[] { Integer.MAX_VALUE, Integer.MAX_VALUE };
+        int width = (int) requestedWidth;
+        int height = (int) requestedHeight;
+        if (width <= 0 && height <= 0) return new int[] { sourceWidth, sourceHeight };
+        if (width <= 0) width = Math.max(1, (int) Math.round((double) sourceWidth * height / sourceHeight));
+        if (height <= 0) height = Math.max(1, (int) Math.round((double) sourceHeight * width / sourceWidth));
+        return new int[] { width, height };
+    }
+
+    private static int readPositiveInt(byte[] value, int offset) {
+        long result = ((long) (value[offset] & 0xff) << 24) | ((long) (value[offset + 1] & 0xff) << 16)
+            | ((long) (value[offset + 2] & 0xff) << 8) | (value[offset + 3] & 0xffL);
+        return result > Integer.MAX_VALUE ? -1 : (int) result;
+    }
+
+    private static String printable(String message) {
+        if (message == null || message.isEmpty()) return "invalid control data";
+        return message.replaceAll("[^ -~]", "?");
+    }
+
+    /**
+     * Converts kitty raw pixel data (f=24 RGB or f=32 RGBA, straight alpha, row-major) into the
+     * non-premultiplied ARGB ints {@code Bitmap.createBitmap(int[], ...)} takes.
+     */
+    static int[] rawPixelsToArgb(byte[] data, int width, int height, int format) {
+        int bytesPerPixel = format / 8;
+        if ((long) width * height * bytesPerPixel != data.length)
+            throw new IllegalArgumentException("pixel data does not match s and v");
+        int[] pixels = new int[width * height];
+        int src = 0;
+        for (int i = 0; i < pixels.length; i++) {
+            int alpha = bytesPerPixel == 4 ? data[src + 3] & 0xff : 0xff;
+            pixels[i] = (alpha << 24) | ((data[src] & 0xff) << 16)
+                | ((data[src + 1] & 0xff) << 8) | (data[src + 2] & 0xff);
+            src += bytesPerPixel;
+        }
+        return pixels;
+    }
+
+    /** Inflates o=z pixel data, requiring the stream to produce exactly {@code expectedBytes}. */
+    static byte[] inflate(byte[] data, long expectedBytes) {
+        if (expectedBytes <= 0 || expectedBytes > MAX_DECODED_BYTES)
+            throw new IllegalArgumentException("compressed pixel data does not match s and v");
+        Inflater inflater = new Inflater();
+        inflater.setInput(data);
+        byte[] out = new byte[(int) expectedBytes];
+        try {
+            int total = 0;
+            while (total < out.length) {
+                int produced = inflater.inflate(out, total, out.length - total);
+                total += produced;
+                if (produced == 0) break;
+            }
+            if (total != out.length)
+                throw new IllegalArgumentException("compressed pixel data does not match s and v");
+            if (!inflater.finished()) {
+                byte[] probe = new byte[1];
+                if (inflater.inflate(probe) > 0 || !inflater.finished())
+                    throw new IllegalArgumentException("compressed pixel data does not match s and v");
+            }
+            return out;
+        } catch (DataFormatException e) {
+            throw new IllegalArgumentException("invalid zlib pixel data");
+        } finally {
+            inflater.end();
+        }
+    }
+
+    interface BitmapProducer {
+        Bitmap produce();
+    }
+
+    /**
+     * One entry of {@link #layerSteps}: a change ready to apply, a place held for the worker, or the
+     * batch of one synchronized update.
+     */
+    private static final class LayerStep {
+        /** Null while the work this step holds a place for is still on the worker. */
+        @Nullable Runnable change;
+        /** Set when a reset let go of the step; its result then applies on arrival. */
+        boolean released;
+        /** A synchronized update's steps in stream order; null for a single step. */
+        @Nullable List<LayerStep> batch;
+        /** Whether the synchronized update has ended, so its batch can take no more steps. */
+        boolean sealed;
+
+        /** A batch is ready once sealed with every step in it back from the worker. */
+        boolean isReady() {
+            if (batch == null) return change != null;
+            if (!sealed) return false;
+            for (LayerStep part : batch) {
+                if (part.change == null) return false;
+            }
+            return true;
+        }
+
+        void apply() {
+            if (batch == null) {
+                change.run();
+                return;
+            }
+            for (LayerStep part : batch) part.change.run();
+        }
+    }
+
+    private static final class Upload {
+        final Command command;
+        final ByteArrayOutputStream data = new ByteArrayOutputStream(8192);
+
+        Upload(Command command) {
+            this.command = command;
+        }
+    }
+
+    static final class Command {
+        final Map<Character, String> values;
+        final char action;
+        final char medium;
+        final char deleteMode;
+        final char compression;
+        final int format;
+        final int width;
+        final int height;
+        final int quiet;
+        final int displayColumns;
+        final int displayRows;
+        final boolean more;
+        final boolean noCursorMovement;
+        final long imageId;
+        final long placementId;
+        final long number;
+        final int srcX;
+        final int srcY;
+        final int srcW;
+        final int srcH;
+        final int cellOffsetX;
+        final int cellOffsetY;
+        final int z;
+        final int placeholder;
+        final int fileSize;
+        final int fileOffset;
+
+        private Command(Map<Character, String> values) {
+            this.values = values;
+            action = character(values, 'a', 't');
+            medium = character(values, 't', 'd');
+            deleteMode = character(values, 'd', 'a');
+            compression = character(values, 'o', (char) 0);
+            format = integer(values, 'f', 32);
+            width = integer(values, 's', 0);
+            height = integer(values, 'v', 0);
+            quiet = integer(values, 'q', 0);
+            displayColumns = integer(values, 'c', 0);
+            displayRows = integer(values, 'r', 0);
+            more = integer(values, 'm', 0) == 1;
+            noCursorMovement = integer(values, 'C', 0) == 1;
+            imageId = unsigned(values, 'i');
+            placementId = unsigned(values, 'p');
+            number = unsigned(values, 'I');
+            srcX = integer(values, 'x', 0);
+            srcY = integer(values, 'y', 0);
+            srcW = integer(values, 'w', 0);
+            srcH = integer(values, 'h', 0);
+            cellOffsetX = integer(values, 'X', 0);
+            cellOffsetY = integer(values, 'Y', 0);
+            z = integer(values, 'z', 0);
+            placeholder = integer(values, 'U', 0);
+            // t=f/t=t window into the named file: S bytes from offset O, 0 meaning "to the end".
+            fileSize = integer(values, 'S', 0);
+            fileOffset = integer(values, 'O', 0);
+            if (quiet < 0 || quiet > 2) throw new IllegalArgumentException("invalid q value");
+        }
+
+        static Command parse(String control) {
+            if (control.length() > MAX_CONTROL_BYTES) throw new IllegalArgumentException("control data too long");
+            Map<Character, String> values = new HashMap<>();
+            if (!control.isEmpty()) {
+                String[] entries = control.split(",", -1);
+                if (entries.length > MAX_CONTROLS) throw new IllegalArgumentException("too many control keys");
+                for (String entry : entries) {
+                    if (entry.length() < 3 || entry.charAt(1) != '=')
+                        throw new IllegalArgumentException("malformed control key");
+                    char key = entry.charAt(0);
+                    String value = entry.substring(2);
+                    if (value.isEmpty()) throw new IllegalArgumentException("empty control value");
+                    values.put(key, value);
+                }
+            }
+            return new Command(values);
+        }
+
+        boolean isContinuation() {
+            // Frame-data chunks must repeat a=f, so it is allowed alongside m and q.
+            for (Character key : values.keySet()) {
+                if (key != 'm' && key != 'q' && !(key == 'a' && action == 'f')) return false;
+            }
+            return values.containsKey('m');
+        }
+
+        private static char character(Map<Character, String> values, char key, char fallback) {
+            String value = values.get(key);
+            if (value == null) return fallback;
+            if (value.length() != 1) throw new IllegalArgumentException("invalid " + key + " value");
+            return value.charAt(0);
+        }
+
+        static int integer(Map<Character, String> values, char key, int fallback) {
+            String value = values.get(key);
+            if (value == null) return fallback;
+            try {
+                return Integer.parseInt(value);
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException("invalid " + key + " value");
+            }
+        }
+
+        static long unsigned(Map<Character, String> values, char key) {
+            String value = values.get(key);
+            if (value == null) return 0;
+            try {
+                long result = Long.parseLong(value);
+                if (result < 0 || result > 0xffffffffL) throw new NumberFormatException();
+                return result;
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException("invalid " + key + " value");
+            }
+        }
+    }
+}

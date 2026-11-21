@@ -165,15 +165,35 @@ public final class TerminalEmulator {
      * - https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-Application-Program-Command-functions
      */
     private static final int ESC_APC = 20;
+    /** Length counter for the current APC (also reused as absorb counter). */
+    private int mApcSequenceLength;
+    /** True while the current APC started with 'G' — kitty graphics. */
+    private boolean mApcKitty;
+    /** True once a kitty APC chose the buffered path. */
+    private boolean mApcKittyBuffered;
     /** Escape processing: `ESC` received while receiving a {@link #ESC_APC} command.  */
     private static final int ESC_APC__ESC = 21;
     /** Escape processing: ESC [ <parameter bytes> */
     private static final int ESC_CSI_UNSUPPORTED_PARAMETER_BYTE = 22;
     /** Escape processing: ESC [ <parameter bytes> <intermediate bytes> */
     private static final int ESC_CSI_UNSUPPORTED_INTERMEDIATE_BYTE = 23;
+    /** Inside a kitty graphics APC past the ';': payload streams straight to the protocol layer. */
+    private static final int ESC_APC_KITTY_PAYLOAD = 27;
+    /** ESC seen while in {@link #ESC_APC_KITTY_PAYLOAD}. */
+    private static final int ESC_APC_KITTY_PAYLOAD_ESCAPE = 28;
+    /** Absorbing an oversized/refused APC silently up to ST. */
+    private static final int ESC_APC_IGNORE = 29;
+    /** ESC seen while in {@link #ESC_APC_IGNORE}. */
+    private static final int ESC_APC_IGNORE_ESCAPE = 30;
 
     /** The number of parameter arguments including colon separated sub-parameters. */
     private static final int MAX_ESCAPE_PARAMETERS = 32;
+
+    static final int MAX_STRING_SEQUENCE_LENGTH = 16 * 1024;
+    /** Buffered ceiling for kitty graphics control data + small payloads. */
+    static final int MAX_KITTY_BUFFERED_APC_LENGTH = 64 * 1024;
+    /** Runaway safety net while absorbing an oversized APC. */
+    private static final int MAX_APC_ABSORB_LENGTH = 64 * 1024 * 1024;
 
     /** DECSET 1 - application cursor keys. */
     private static final int DECSET_BIT_APPLICATION_CURSOR_KEYS = 1;
@@ -493,8 +513,23 @@ public final class TerminalEmulator {
         }
     }
 
+    /** The kitty graphics protocol state and image store. */
+    private final KittyGraphicsProtocol mKittyGraphics;
+    /** Bumped whenever kitty placements change so the view can invalidate. */
+    long mKittyPlacementGeneration;
+    /** Bumped on every screen scroll so kitty can scroll-checkpoint placements. */
+    private long mScrollEventCount;
+    /** True while placeKittyGraphics is mutating placements (recursion guard). */
+    private boolean mPlacingKittyGraphics;
+    /** Whether any kitty cell has ever been drawn (view hook). */
+    private boolean mHasAnyKittyCell;
+
     public TerminalEmulator(TerminalOutput session, int columns, int rows, int cellWidthPixels, int cellHeightPixels, Integer transcriptRows, TerminalSessionClient client) {
         mSession = session;
+        mKittyGraphics = new KittyGraphicsProtocol(this, session);
+        TerminalBuffer.UnreachableImageListener collected = this::onKittyCellsCollected;
+        mMainBuffer.setUnreachableImageListener(collected);
+        mAltBuffer.setUnreachableImageListener(collected);
         mScreen = mMainBuffer = new TerminalBuffer(client, columns, getTerminalTranscriptRows(transcriptRows), rows);
         mAltBuffer = new TerminalBuffer(client, columns, rows, rows);
         mClient = client;
@@ -686,8 +721,19 @@ public final class TerminalEmulator {
      * @param length the number of bytes in the array to process
      */
     public void append(byte[] buffer, int length) {
-        for (int i = 0; i < length; i++)
-            processByte(buffer[i]);
+        int i = 0;
+        while (i < length) {
+            // The kitty payload fast path: hand whole runs of plain ASCII to the streaming decoder.
+            if (mEscapeState == ESC_APC_KITTY_PAYLOAD && mUtf8ToFollow == 0) {
+                int start = i;
+                while (i < length && buffer[i] >= 32 && buffer[i] != 127) i++;
+                if (i > start && !mKittyGraphics.streamFeed(buffer, start, i - start)) {
+                    startApcAbsorb();
+                }
+                if (i >= length) return;
+            }
+            processByte(buffer[i++]);
+        }
     }
 
     private void processByte(byte byteToProcess) {
@@ -785,6 +831,26 @@ public final class TerminalEmulator {
         } else if (mEscapeState == ESC_APC__ESC) {
             mContinueSequence = false;
             receiveApcEsc(b);
+            if (!mContinueSequence) mEscapeState = ESC_NONE;
+            return;
+        } else if (mEscapeState == ESC_APC_KITTY_PAYLOAD) {
+            mContinueSequence = false;
+            receiveApcKittyPayload(b);
+            if (!mContinueSequence) mEscapeState = ESC_NONE;
+            return;
+        } else if (mEscapeState == ESC_APC_KITTY_PAYLOAD_ESCAPE) {
+            mContinueSequence = false;
+            receiveApcKittyPayloadEsc(b);
+            if (!mContinueSequence) mEscapeState = ESC_NONE;
+            return;
+        } else if (mEscapeState == ESC_APC_IGNORE) {
+            mContinueSequence = false;
+            receiveApcIgnore(b);
+            if (!mContinueSequence) mEscapeState = ESC_NONE;
+            return;
+        } else if (mEscapeState == ESC_APC_IGNORE_ESCAPE) {
+            mContinueSequence = false;
+            receiveApcIgnoreEsc(b);
             if (!mContinueSequence) mEscapeState = ESC_NONE;
             return;
         }
@@ -1855,6 +1921,8 @@ public final class TerminalEmulator {
                 // Reset: Use Normal Screen Buffer and restore cursor as in DECRC.
                 TerminalBuffer newScreen = setting ? mAltBuffer : mMainBuffer;
                 if (newScreen != mScreen) {
+                    mKittyGraphics.screenSwitched();
+                    if (mAltBuffer.deleteKittyImages(-1, true) > 0) mKittyPlacementGeneration++;
                     boolean resized = !(newScreen.mColumns == mColumns && newScreen.mScreenRows == mRows);
                     if (setting) saveCursor();
                     mScreen = newScreen;
@@ -1965,8 +2033,222 @@ public final class TerminalEmulator {
         }
     }
 
+
+    /** The buffered ceiling for the current APC: kitty commands get room, the rest the old bound. */
+    private int apcBufferLimit() {
+        return mApcKitty ? MAX_KITTY_BUFFERED_APC_LENGTH : MAX_STRING_SEQUENCE_LENGTH;
+    }
+
+    /** When streaming a kitty graphics payload ({@link #ESC_APC_KITTY_PAYLOAD}). */
+    private void receiveApcKittyPayload(final int b) {
+        if (b == 27) {
+            continueSequence(ESC_APC_KITTY_PAYLOAD_ESCAPE);
+        } else if (!mKittyGraphics.streamFeed(b)) {
+            startApcAbsorb();
+        }
+    }
+
+    /** ESC inside a streamed kitty payload: ST finishes; anything else is (invalid) payload. */
+    private void receiveApcKittyPayloadEsc(final int b) {
+        if (b == '\\') {
+            mKittyGraphics.finishStream();
+            finishSequence();
+            return;
+        }
+        if (!mKittyGraphics.streamFeed(27) || !mKittyGraphics.streamFeed(b)) {
+            startApcAbsorb();
+            return;
+        }
+        continueSequence(ESC_APC_KITTY_PAYLOAD);
+    }
+
+    /** Discard the rest of the current APC up to its String Terminator, printing nothing. */
+    private void startApcAbsorb() {
+        mOSCOrDeviceControlArgs.setLength(0);
+        mApcSequenceLength = 0;
+        continueSequence(ESC_APC_IGNORE);
+    }
+
+    private void receiveApcIgnore(final int b) {
+        if (b == 27) {
+            continueSequence(ESC_APC_IGNORE_ESCAPE);
+        } else if (++mApcSequenceLength > MAX_APC_ABSORB_LENGTH) {
+            finishSequence();
+        }
+    }
+
+    private void receiveApcIgnoreEsc(final int b) {
+        if (b == '\\') {
+            finishSequence();
+        } else {
+            mApcSequenceLength += 2;
+            continueSequence(ESC_APC_IGNORE);
+        }
+    }
+
+    long scrollEventCount() {
+        return mScrollEventCount;
+    }
+    public int getCellWidthPixels() {
+        return mCellWidthPixels;
+    }
+    public int getCellHeightPixels() {
+        return mCellHeightPixels;
+    }
+    void noteKittyPlacementPixelsReplaced() {
+        mKittyPlacementGeneration++;
+    }
+    boolean placeKittyGraphics(Bitmap bitmap, boolean ownsBitmap, long ownedBytes,
+                               KittyGraphicsProtocol.Command command, long imageId, int row, int col,
+                               int[] source, int width, int height, int offsetX, int offsetY,
+                               int cellWidth, int cellHeight) {
+        // A picture taller than the screen may have pushed its own top row into the scrollback
+        // while the cursor moved past it; it is anchored there, as the text it came with is.
+        if (bitmap == null || row < -mScreen.getActiveTranscriptRows() || row >= mRows
+            || col < 0 || col >= mColumns)
+            return false;
+        mPlacingKittyGraphics = true;
+        try {
+            KittyPlacement placement = null;
+            if (command.action == 'p') {
+                // Unidentified placements are additive, which is what makes several per image work.
+                if (command.placementId != 0) {
+                    placement = mScreen.findKittyPlacement(imageId, command.placementId);
+                    if (placement != null && placement.anchor != null)
+                        placement.anchor.removeKittyPlacement(placement);
+                }
+            } else if (imageId != 0) {
+                mMainBuffer.deleteKittyImages(imageId, true);
+                mAltBuffer.deleteKittyImages(imageId, true);
+            }
+            long previousBytes = placement == null ? 0 : placement.ownedBytes;
+            long addedBytes = ownsBitmap ? Math.max(0, ownedBytes) : 0;
+            if (addedBytes > 0
+                && getKittyGraphicsBytes() - previousBytes + addedBytes > KittyGraphicsProtocol.MAX_DECODED_BYTES) {
+                return false;
+            }
+            if (placement == null) placement = new KittyPlacement(imageId, command.placementId);
+            placement.bitmap = bitmap;
+            placement.ownsBitmap = ownsBitmap;
+            placement.ownedBytes = addedBytes;
+            placement.z = command.z;
+            placement.column = col;
+            placement.sourceX = source[0];
+            placement.sourceY = source[1];
+            placement.sourceWidth = source[2];
+            placement.sourceHeight = source[3];
+            placement.width = width;
+            placement.height = height;
+            placement.offsetX = offsetX;
+            placement.offsetY = offsetY;
+            placement.cellWidth = Math.max(1, cellWidth);
+            placement.cellHeight = Math.max(1, cellHeight);
+            placement.fitToColumns(mColumns);
+            placement.rows = Math.max(1, (height + offsetY + placement.cellHeight - 1) / placement.cellHeight);
+            mScreen.putKittyPlacement(placement, row);
+            mKittyPlacementGeneration++;
+            return true;
+        } finally {
+            mPlacingKittyGraphics = false;
+        }
+    }
+    boolean isKittyImageOnScreen(long imageId) {
+        if (mTopRowProvider == null) return true;
+        return mScreen.hasKittyImageInRows(imageId, mTopRowProvider.topRow(), mRows);
+    }
+    boolean isAnyKittyPlaceholderCellOnScreen() {
+        if (mTopRowProvider == null) return true;
+        return mScreen.hasKittyPlaceholderCellInRows(mTopRowProvider.topRow(), mRows);
+    }
+    boolean hasAnyKittyPlaceholderCell() {
+        return mMainBuffer.hasAnyKittyPlaceholderCell() || mAltBuffer.hasAnyKittyPlaceholderCell();
+    }
+    void deleteKittyImageEverywhere(long imageId) {
+        if (mMainBuffer.deleteKittyImages(imageId, true) + mAltBuffer.deleteKittyImages(imageId, true) > 0)
+            mKittyPlacementGeneration++;
+    }
+    void deleteVisibleKittyGraphics() {
+        if (mScreen.deleteKittyImages(-1, false) > 0) mKittyPlacementGeneration++;
+    }
+    void deleteAllKittyGraphics() {
+        if (mMainBuffer.deleteKittyImages(-1, true) + mAltBuffer.deleteKittyImages(-1, true) > 0)
+            mKittyPlacementGeneration++;
+    }
+    void advanceKittyGraphicsCursor(KittyGraphicsProtocol.Command command, int imageWidth, int imageHeight,
+                                    int row, int col, int cellWidth, int cellHeight) {
+        if (command.noCursorMovement) return;
+        int columns = Math.min(mColumns - col, (imageWidth + cellWidth - 1) / cellWidth);
+        int rows = (imageHeight + cellHeight - 1) / cellHeight;
+        int nextColumn = col + columns;
+        if (nextColumn < mColumns) {
+            rows--;
+        } else {
+            nextColumn = 0;
+        }
+        setCursorRowCol(row, col);
+        while (rows-- > 0) doLinefeed();
+        setCursorCol(nextColumn);
+    }
+    long getKittyGraphicsBytes() {
+        return mMainBuffer.getKittyImageBytes() + mAltBuffer.getKittyImageBytes();
+    }
+    public boolean getKittyImagePlaceholder(long imageId, long placementId,
+                                            KittyImagePlaceholder out) {
+        return mKittyGraphics.getPlaceholder(imageId, placementId, out);
+    }
+    public long getKittyImageGeneration(long imageId) {
+        return mKittyGraphics.imageGeneration(imageId);
+    }
+    public long getKittyPlacementGeneration() {
+        return mKittyPlacementGeneration;
+    }
+    private void onKittyCellsCollected() {
+        if (mPlacingKittyGraphics) return;
+        mKittyGraphics.dropFramesOfUnreachableImages();
+    }
+    public boolean isScreenUpdateHeld() {
+        // Mode 2026 synchronized updates are not modeled; the screen is never held.
+        return false;
+    }
+
+    /** The placements reaching into the given rows, for the renderer's layer pass. */
+    public void collectKittyPlacements(int topRow, int rowCount, java.util.List<KittyPlacement> out) {
+        mScreen.collectVisibleKittyPlacements(topRow, rowCount, out);
+    }
+
+    public void shutdownKittyGraphics() {
+        mKittyGraphics.shutdown();
+    }
+
+    public interface TopRowProvider {
+        int topRow();
+    }
+
+    private TopRowProvider mTopRowProvider;
+
+    public void setTopRowProvider(TopRowProvider provider) {
+        mTopRowProvider = provider;
+    }
+
+
+    /** Delete the kitty placements the filter matches on the current screen, returning them. */
+    java.util.List<KittyPlacement> deleteKittyPlacements(TerminalBuffer.KittyPlacementFilter filter,
+                                                         boolean includeScrollback) {
+        java.util.List<KittyPlacement> deleted = mScreen.deleteKittyImages(filter, includeScrollback);
+        if (!deleted.isEmpty()) mKittyPlacementGeneration++;
+        return deleted;
+    }
+
+    java.util.List<KittyPlacement> kittyPlacementsFor(long imageId) {
+        java.util.List<KittyPlacement> result = new java.util.ArrayList<>();
+        mMainBuffer.collectKittyPlacements(imageId, result);
+        mAltBuffer.collectKittyPlacements(imageId, result);
+        return result;
+    }
+
     private void startEscapeSequence() {
         mEscapeState = ESC;
+        mApcSequenceLength = 0;
         mArgIndex = 0;
         Arrays.fill(mArgs, -1);
         mArgsSubParamsBitSet = 0;
@@ -2592,31 +2874,48 @@ public final class TerminalEmulator {
      * Receive {@link #ESC_APC}. Check its docs for more info.
      */
     private void receiveApc(final int b) {
-        switch (b) {
-            case 27: // Escape.
-                continueSequence(ESC_APC__ESC);
-                break;
-            default:
-                if (!collectTerminalControlArgs(b)) return;
+        if (b == 27) {
+            continueSequence(ESC_APC__ESC);
+            return;
         }
+        if (mApcSequenceLength == 0 && b == 'G') mApcKitty = true;
+        if (++mApcSequenceLength > apcBufferLimit()) {
+            startApcAbsorb();
+            return;
+        }
+        if (mApcKitty && !mApcKittyBuffered && b == ';') {
+            switch (mKittyGraphics.beginStream(mOSCOrDeviceControlArgs.length() > 0
+                    ? mOSCOrDeviceControlArgs.substring(1) : "")) {
+                case KittyGraphicsProtocol.STREAM_UPLOAD:
+                    mOSCOrDeviceControlArgs.setLength(0);
+                    continueSequence(ESC_APC_KITTY_PAYLOAD);
+                    return;
+                case KittyGraphicsProtocol.STREAM_REJECT:
+                    startApcAbsorb();
+                    return;
+                default:
+                    mApcKittyBuffered = true;
+                    break;
+            }
+        }
+        mOSCOrDeviceControlArgs.appendCodePoint(b);
     }
 
     /**
      * Receive {@link #ESC_APC__ESC}. Check its docs for more info.
      */
     private void receiveApcEsc(final int b) {
-        switch (b) {
-            case '\\':
-                //doApc();
-                //clearApcTypeVariables();
-                break;
-            default:
-                // The ESC character was not followed by a \, so insert the ESC and
-                // the current character in arg buffer.
-                if (!collectTerminalControlArgs(27)) return;
-                if (!collectTerminalControlArgs(b)) return;
-                continueSequence(ESC_APC);
-                break;
+        if (b == '\\') {
+            // A String Terminator (ST), ending the APC escape sequence.
+            mKittyGraphics.accept(mOSCOrDeviceControlArgs.toString());
+            finishSequence();
+        } else if (mApcSequenceLength > apcBufferLimit() - 2) {
+            startApcAbsorb();
+        } else {
+            mApcSequenceLength += 2;
+            mOSCOrDeviceControlArgs.append('\033');
+            mOSCOrDeviceControlArgs.appendCodePoint(b);
+            continueSequence(ESC_APC);
         }
     }
 
@@ -3064,6 +3363,7 @@ public final class TerminalEmulator {
 
     private void scrollDownOneLine() {
         mScrollCounter++;
+        mScrollEventCount++;
         long currentStyle = getStyle();
         if (mLeftMargin != 0 || mRightMargin != mColumns) {
             // Horizontal margin: Do not put anything into scroll history, just non-margin part of screen up.
