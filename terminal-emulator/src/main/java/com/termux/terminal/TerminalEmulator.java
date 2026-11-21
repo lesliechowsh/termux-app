@@ -527,12 +527,12 @@ public final class TerminalEmulator {
 
     public TerminalEmulator(TerminalOutput session, int columns, int rows, int cellWidthPixels, int cellHeightPixels, Integer transcriptRows, TerminalSessionClient client) {
         mSession = session;
+        mScreen = mMainBuffer = new TerminalBuffer(client, columns, getTerminalTranscriptRows(transcriptRows), rows);
+        mAltBuffer = new TerminalBuffer(client, columns, rows, rows);
         mKittyGraphics = new KittyGraphicsProtocol(this, session);
         TerminalBuffer.UnreachableImageListener collected = this::onKittyCellsCollected;
         mMainBuffer.setUnreachableImageListener(collected);
         mAltBuffer.setUnreachableImageListener(collected);
-        mScreen = mMainBuffer = new TerminalBuffer(client, columns, getTerminalTranscriptRows(transcriptRows), rows);
-        mAltBuffer = new TerminalBuffer(client, columns, rows, rows);
         mClient = client;
         mRows = rows;
         mColumns = columns;
