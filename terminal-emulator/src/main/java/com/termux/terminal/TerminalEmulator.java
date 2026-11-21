@@ -1,5 +1,6 @@
 package com.termux.terminal;
 
+import android.graphics.Bitmap;
 import android.util.Base64;
 
 import java.nio.charset.StandardCharsets;
@@ -2064,7 +2065,7 @@ public final class TerminalEmulator {
 
     /** Discard the rest of the current APC up to its String Terminator, printing nothing. */
     private void startApcAbsorb() {
-        mOSCOrDeviceControlArgs.setLength(0);
+        mTerminalControlArgs.setLength(0);
         mApcSequenceLength = 0;
         continueSequence(ESC_APC_IGNORE);
     }
@@ -2878,10 +2879,10 @@ public final class TerminalEmulator {
             return;
         }
         if (mApcKitty && !mApcKittyBuffered && b == ';') {
-            switch (mKittyGraphics.beginStream(mOSCOrDeviceControlArgs.length() > 0
-                    ? mOSCOrDeviceControlArgs.substring(1) : "")) {
+            switch (mKittyGraphics.beginStream(mTerminalControlArgs.length() > 0
+                    ? mTerminalControlArgs.substring(1) : "")) {
                 case KittyGraphicsProtocol.STREAM_UPLOAD:
-                    mOSCOrDeviceControlArgs.setLength(0);
+                    mTerminalControlArgs.setLength(0);
                     continueSequence(ESC_APC_KITTY_PAYLOAD);
                     return;
                 case KittyGraphicsProtocol.STREAM_REJECT:
@@ -2892,7 +2893,7 @@ public final class TerminalEmulator {
                     break;
             }
         }
-        mOSCOrDeviceControlArgs.appendCodePoint(b);
+        mTerminalControlArgs.appendCodePoint(b);
     }
 
     /**
@@ -2901,14 +2902,14 @@ public final class TerminalEmulator {
     private void receiveApcEsc(final int b) {
         if (b == '\\') {
             // A String Terminator (ST), ending the APC escape sequence.
-            mKittyGraphics.accept(mOSCOrDeviceControlArgs.toString());
+            mKittyGraphics.accept(mTerminalControlArgs.toString());
             finishSequence();
         } else if (mApcSequenceLength > apcBufferLimit() - 2) {
             startApcAbsorb();
         } else {
             mApcSequenceLength += 2;
-            mOSCOrDeviceControlArgs.append('\033');
-            mOSCOrDeviceControlArgs.appendCodePoint(b);
+            mTerminalControlArgs.append('\033');
+            mTerminalControlArgs.appendCodePoint(b);
             continueSequence(ESC_APC);
         }
     }
