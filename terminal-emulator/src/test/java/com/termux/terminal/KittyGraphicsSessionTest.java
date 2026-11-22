@@ -9,6 +9,54 @@ import java.util.List;
  */
 public class KittyGraphicsSessionTest extends KittyGraphicsTestCase {
 
+    public void testScrollRecycleDropsThePlacementOfTheEvictedRow() {
+        // The default transcript here is 2000 rows below the 3 screen rows: once it is full,
+        // the next scroll recycles the oldest transcript slot — the image's anchor row — as
+        // the blank bottom row. The placement died with its line: it must not render on the
+        // recycled row.
+        enterString(apc("a=T,i=7,f=24,s=1,v=1;" + base64(1, 2, 3)));
+        mOutput.getOutputAndClear();
+        assertEquals(1, placements(7).size());
+        StringBuilder linefeeds = new StringBuilder();
+        linefeeds.append('\n'); // Reaches the bottom row.
+        for (int i = 0; i < 2000; i++) linefeeds.append('\n'); // Scrolls, the last recycling the anchor.
+        enterString(linefeeds.toString());
+        assertEquals(0, placements(7).size());
+        assertLinesAre("     ", "     ", "     ");
+        assertCursorAt(2, 1); // The image advanced the cursor one column; linefeeds keep it.
+    }
+
+    public void testEraseInDisplayDropsPlacements() {
+        // CSI 2J clears the screen; the placements on it are cleared with it.
+        enterString(apc("a=T,i=7,f=24,s=1,v=1;" + base64(1, 2, 3)));
+        assertEquals(reply("i=7", "OK"), mOutput.getOutputAndClear());
+        assertEquals(1, placements(7).size());
+        enterString("\033[2J");
+        assertEquals(0, placements(7).size());
+        assertLinesAre("     ", "     ", "     ");
+    }
+
+    public void testResetMidApcLeavesACleanParser() {
+        // Half a non-kitty APC, then a reset (RIS) mid-APC: what follows must be classified
+        // as if from a clean parser. A reset that bypassed the escape-state teardown left the
+        // APC sequence length standing, so the unrelated APC below met a stale parser and a
+        // real kitty upload was buffered under the plain 16 KiB sequence limit and silently
+        // dropped.
+        enterString("\033_x=1"); // Mid-APC, no terminator.
+        mTerminal.reset();
+        enterString("\033_a;b\033\\"); // Unrelated APC containing ';'.
+        assertLinesAre("     ", "     ", "     ");
+        assertEquals("", mOutput.getOutputAndClear());
+        // A real kitty upload now streams and answers normally: its 16384-char base64 payload
+        // (12288 pixel bytes) must never touch the buffered limit.
+        StringBuilder payload = new StringBuilder();
+        for (int i = 0; i < 4096; i++) payload.append("AQEB");
+        enterString("\033_Ga=T,i=7,f=24,s=4096,v=1;" + payload + "\033\\");
+        assertEquals(reply("i=7", "OK"), mOutput.getOutputAndClear());
+        assertEquals(1, placements(7).size());
+        assertLinesAre("     ", "     ", "     ");
+    }
+
     public void testCancelMidPayloadDropsTheWholeCommand() {
         // CAN (0x18) is consumed silently: nothing is printed and the parser returns to ground.
         // The printed cell puts the cursor off the origin, so "cursor unmoved" is a real claim.

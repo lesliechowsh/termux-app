@@ -149,6 +149,9 @@ public final class TerminalRow {
         mSpaceUsed = mColumns;
         mHasNonOneWidthOrSurrogateChars = false;
         mHasTerminalBitmap = false;
+        // The placements go with the line they were anchored to: a cleared row kept rendering
+        // them on whatever the recycled slot held next.
+        dropKittyPlacements();
     }
 
     // https://github.com/steven676/Android-Terminal-Emulator/commit/9a47042620bec87617f0b4f5d50568535668fe26

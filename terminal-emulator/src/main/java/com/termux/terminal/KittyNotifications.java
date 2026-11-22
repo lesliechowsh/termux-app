@@ -61,7 +61,7 @@ public final class KittyNotifications {
     private static final int MAX_LIVE = 64;
 
     /** Ceiling on one assembled title or body, so a runaway program cannot eat the heap. */
-    private static final int MAX_TEXT_LENGTH = 64 * 1024;
+    static final int MAX_TEXT_LENGTH = 64 * 1024;
 
     /** What kitty separates button labels with. */
     private static final char BUTTON_SEPARATOR = ' ';

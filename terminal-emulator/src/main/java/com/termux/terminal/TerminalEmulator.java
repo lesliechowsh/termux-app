@@ -2154,22 +2154,33 @@ public final class TerminalEmulator {
         mPlacingKittyGraphics = true;
         try {
             KittyPlacement placement = null;
+            long previousBytes = 0;
             if (command.action == 'p') {
                 // Unidentified placements are additive, which is what makes several per image work.
                 if (command.placementId != 0) {
                     placement = mScreen.findKittyPlacement(imageId, command.placementId);
-                    if (placement != null && placement.anchor != null)
-                        placement.anchor.removeKittyPlacement(placement);
+                    if (placement != null) previousBytes = placement.ownedBytes;
                 }
+            }
+            long addedBytes = ownsBitmap ? Math.max(0, ownedBytes) : 0;
+            // The byte budget is checked before anything is taken down: a refused placement
+            // must not take the picture it replaces with it. `previousBytes` covers whatever
+            // this command will remove, so the budget reads the same before and after it.
+            if (addedBytes > 0) {
+                if (command.action != 'p' && imageId != 0) {
+                    for (KittyPlacement replaced : kittyPlacementsFor(imageId))
+                        previousBytes += replaced.ownedBytes;
+                }
+                if (getKittyGraphicsBytes() - previousBytes + addedBytes > KittyGraphicsProtocol.MAX_DECODED_BYTES) {
+                    return false;
+                }
+            }
+            if (command.action == 'p') {
+                if (placement != null && placement.anchor != null)
+                    placement.anchor.removeKittyPlacement(placement);
             } else if (imageId != 0) {
                 mMainBuffer.deleteKittyImages(imageId, true);
                 mAltBuffer.deleteKittyImages(imageId, true);
-            }
-            long previousBytes = placement == null ? 0 : placement.ownedBytes;
-            long addedBytes = ownsBitmap ? Math.max(0, ownedBytes) : 0;
-            if (addedBytes > 0
-                && getKittyGraphicsBytes() - previousBytes + addedBytes > KittyGraphicsProtocol.MAX_DECODED_BYTES) {
-                return false;
             }
             if (placement == null) placement = new KittyPlacement(imageId, command.placementId);
             placement.bitmap = bitmap;
@@ -2550,6 +2561,7 @@ public final class TerminalEmulator {
                     case 2: // Erase all of the display - all lines are erased, changed to single-width, and the cursor does not
                         // move..
                         blockClear(0, 0, mColumns, mRows);
+                        mKittyGraphics.screenCleared();
                         break;
                     case 3: // Delete all lines saved in the scrollback buffer (xterm etc)
                         mMainBuffer.clearTranscript();
@@ -3087,6 +3099,20 @@ public final class TerminalEmulator {
                     terminalControlArgsMaxLength = TerminalBitmap.MAX_BITMAP_SIZE +
                         /* `1337;File=inline=1;size=209715200;name=xxxxxxxxxxxxxxxxxxxxxxxx;width=8192px;height=8192px;preserveAspectRatio=1:` */ 150;
                     break;
+                case 5522:
+                    // Kitty extended clipboard write payloads are base64 in the args, and a
+                    // write may carry `MAX_WRITE_BYTES` of decoded data. Refusing one
+                    // mid-packet would finish the sequence and print the rest of the base64
+                    // on the screen.
+                    terminalControlArgsMaxLength = (KittyClipboard.MAX_WRITE_BYTES / 3 + 1) * 4 +
+                        /* `5522;type=write:mime=..:pw=..:id=..;` */ 256;
+                    break;
+                case 99:
+                    // A desktop notification's body may run to `MAX_TEXT_LENGTH` of base64 in
+                    // one packet, plus `99;i=..:p=..:n=..:e=..;` metadata.
+                    terminalControlArgsMaxLength = (KittyNotifications.MAX_TEXT_LENGTH / 3 + 1) * 4 +
+                        /* `99;i=..:p=..:n=..:e=..;` */ 256;
+                    break;
             }
 
             if (terminalControlArgsCapacity != null) {
@@ -3145,6 +3171,10 @@ public final class TerminalEmulator {
             case 99:
                 // The rich desktop notification (OSC 99). May arrive in pieces.
                 mKittyNotifications.handle(textParameter, mKittyNotificationHandler);
+                break;
+            case 9:
+                // iTerm2's growl-style notification: 9;body. No title.
+                mSession.onNotification(null, textParameter);
                 break;
             case 777: {
                 // rxvt-unicode's notification: 777;notify;title;body.
@@ -3880,7 +3910,7 @@ public final class TerminalEmulator {
         setCursorStyle();
         mArgIndex = 0;
         mContinueSequence = false;
-        mEscapeState = ESC_NONE;
+        finishSequence();
         mInsertMode = false;
         mTopMargin = mLeftMargin = 0;
         mBottomMargin = mRows;

@@ -705,7 +705,7 @@ final class KittyGraphicsProtocol {
         final int offsetX = command.cellOffsetX;
         final int offsetY = command.cellOffsetY;
         final int[] displaySize = displaySize(command, sourceWidth, sourceHeight, cellWidth, cellHeight);
-        if ((long) (displaySize[0] + offsetX) * (displaySize[1] + offsetY) * 4L > MAX_DECODED_BYTES) {
+        if (displayExceedsSessionBytes(displaySize, offsetX, offsetY)) {
             if (storeRequested) store.abandon(effectiveId);
             reply(command, "ENOSPC:display image exceeds session limit", true, false, effectiveId);
             return;
@@ -837,7 +837,7 @@ final class KittyGraphicsProtocol {
         final int offsetX = command.cellOffsetX;
         final int offsetY = command.cellOffsetY;
         final int[] displaySize = displaySize(command, crop[2], crop[3], cellWidth, cellHeight);
-        if ((long) (displaySize[0] + offsetX) * (displaySize[1] + offsetY) * 4L > MAX_DECODED_BYTES) {
+        if (displayExceedsSessionBytes(displaySize, offsetX, offsetY)) {
             reply(command, "ENOSPC:display image exceeds session limit", true, false, id);
             return;
         }
@@ -1879,6 +1879,18 @@ final class KittyGraphicsProtocol {
         if (width <= 0) width = Math.max(1, (int) Math.round((double) sourceWidth * height / sourceHeight));
         if (height <= 0) height = Math.max(1, (int) Math.round((double) sourceHeight * width / sourceWidth));
         return new int[] { width, height };
+    }
+
+    /**
+     * Whether a displayed rectangle of this size would exceed {@link #MAX_DECODED_BYTES}. The
+     * dimensions are compared by division, not multiplication: {@link #displaySize} clamps
+     * out-of-range c=/r= to Integer.MAX_VALUE, where the product overflows negative and passes
+     * a multiplication check — and the cursor then linefeeds for the clamped height.
+     */
+    private static boolean displayExceedsSessionBytes(int[] displaySize, int offsetX, int offsetY) {
+        long width = (long) displaySize[0] + offsetX;
+        long height = (long) displaySize[1] + offsetY;
+        return width > MAX_DECODED_BYTES / 4 / height;
     }
 
     private static int readPositiveInt(byte[] value, int offset) {

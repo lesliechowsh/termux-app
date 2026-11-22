@@ -223,6 +223,52 @@ public class KittyGraphicsTransmitTest extends KittyGraphicsTestCase {
         assertEquals(1, moved);
     }
 
+    public void testHugeDisplayClampIsRefusedWithoutHanging() {
+        // c/r far past the pixel budget clamp to Integer.MAX_VALUE, where the display size
+        // check's product wrapped negative and passed — then the cursor advanced for the
+        // clamped height, linefeeding millions of times. The check must refuse, answer, and
+        // move nothing.
+        enterString(apc("a=T,i=1,f=32,s=1,v=1,c=2147483647,r=2147483647;" + base64(1, 2, 3, 4)));
+        assertEquals(reply("i=1", "ENOSPC:display image exceeds session limit"), mOutput.getOutputAndClear());
+        assertEquals(0, placements(1).size());
+        assertNull(storedImage(1));
+        assertCursorAt(0, 0);
+        assertLinesAre("     ", "     ", "     ");
+        // A cell offset that wraps the clamped width negative must not sneak past either.
+        enterString(apc("a=T,i=1,f=32,s=1,v=1,c=2147483647,r=2147483647,X=1;" + base64(1, 2, 3, 4)));
+        assertEquals(reply("i=1", "ENOSPC:display image exceeds session limit"), mOutput.getOutputAndClear());
+        assertCursorAt(0, 0);
+        assertEquals(0, placements(1).size());
+    }
+
+    public void testBudgetRefusedReplacementLeavesTheOldPlacementInPlace() {
+        // Byte pressure from owning placements: anonymous displays own their pixels.
+        // 4096*2047*4 = 33521664 bytes, then 4*1*4 = 16 more; the cap is 33554432.
+        enterString(apc("a=T,f=100,c=1,r=1;" + base64(pngHeader(4096, 2047))));
+        mOutput.getOutputAndClear();
+        enterString(apc("a=T,f=100,c=1,r=1;" + base64(pngHeader(4, 1))));
+        mOutput.getOutputAndClear();
+        // A stored 1x1 image placed under (i=7, p=9) at column 2.
+        enterString(apc("a=t,i=7,f=100;" + base64(pngHeader(1, 1))));
+        enterString(apc("a=p,i=7,p=9"));
+        mOutput.getOutputAndClear();
+        assertEquals(1, placements(7).size());
+        // A re-placement of (7, 9) owning 40000 bytes would push the session past the cap:
+        // refused, and the placement it replaces must not be taken down with it. The call
+        // goes straight to the emulator's placement path, the only harness-reachable way to
+        // make a re-placement carry owned bytes: a stored image shares at zero cost.
+        KittyGraphicsProtocol.Command replace = KittyGraphicsProtocol.Command.parse("a=p,i=7,p=9");
+        boolean placed = mTerminal.placeKittyGraphics(testBitmap(), true, 40000, replace, 7,
+            0, 0, new int[] {0, 0, 1, 1}, 13, 15, 0, 0, 13, 15);
+        assertFalse(placed);
+        assertEquals(1, placements(7).size());
+        KittyPlacement kept = placements(7).get(0);
+        assertEquals(7, kept.getImageId());
+        assertEquals(9, kept.getPlacementId());
+        assertEquals(2, kept.getColumn());
+        assertEquals(0, kept.getRow());
+    }
+
     public void testUnicodePlacementRequiresAnImageId() {
         // U=1 without i= or I= names no image to place.
         enterString(apc("a=T,U=1,f=24,s=1,v=1;" + base64(1, 2, 3)));
