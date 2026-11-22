@@ -14,7 +14,7 @@ public abstract class TerminalOutput {
         write(bytes, 0, bytes.length);
     }
 
-    /** Write bytes to the terminal client. */
+    /** Notify the terminal client that the terminal's title changed. */
     public abstract void titleChanged(String oldTitle, String newTitle);
 
     /** Notify the terminal client that text should be copied to clipboard. */
@@ -101,6 +101,7 @@ public abstract class TerminalOutput {
      * how to show a title and a body keeps working.
      */
     public void onKittyNotification(KittyNotification notification) {
+        onNotification(notification.getTitle(), notification.getBody());
     }
 
     /** Take down the notification the program named, if it is still up. */

@@ -22,4 +22,15 @@ public class Handler {
     public boolean sendEmptyMessage(int what) {
         return false;
     }
+
+    /** No looper runs on the JVM, so a posted runnable is never dispatched. */
+    public boolean post(Runnable r) {
+        return false;
+    }
+
+    public boolean postDelayed(Runnable r, long delayMillis) {
+        return false;
+    }
+
+    public void removeCallbacks(Runnable r) {}
 }
