@@ -111,6 +111,9 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
     public void onCreate() {
         Logger.logVerbose(LOG_TAG, "onCreate");
 
+        // Register the context that program notifications (OSC 9, OSC 777, OSC 99) are posted with
+        TermuxTerminalSessionClientBase.setAppContext(this);
+
         // Get Termux app SharedProperties without loading from disk since TermuxApplication handles
         // load and TermuxActivity handles reloads
         mProperties = TermuxAppSharedProperties.getProperties();
@@ -846,6 +849,9 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
 
         NotificationUtils.setupNotificationChannel(this, TermuxConstants.TERMUX_APP_NOTIFICATION_CHANNEL_ID,
             TermuxConstants.TERMUX_APP_NOTIFICATION_CHANNEL_NAME, NotificationManager.IMPORTANCE_LOW);
+
+        NotificationUtils.setupNotificationChannel(this, TermuxConstants.TERMUX_APP_PROGRAM_NOTIFICATION_CHANNEL_ID,
+            TermuxConstants.TERMUX_APP_PROGRAM_NOTIFICATION_CHANNEL_NAME, NotificationManager.IMPORTANCE_DEFAULT);
     }
 
     /** Update the shown foreground service notification after making any changes that affect it. */

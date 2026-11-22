@@ -1,5 +1,6 @@
 package com.termux.app;
 
+import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
@@ -10,6 +11,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.ServiceConnection;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.IBinder;
 import android.view.ContextMenu;
@@ -189,6 +191,9 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
     private static final int CONTEXT_MENU_SETTINGS_ID = 8;
     private static final int CONTEXT_MENU_REPORT_ID = 9;
 
+    /** Request code used to ask the user to grant the post notifications runtime permission. */
+    private static final int REQUEST_GRANT_POST_NOTIFICATIONS_PERMISSION = 2002;
+
     private static final String ARG_TERMINAL_TOOLBAR_TEXT_INPUT = "terminal_toolbar_text_input";
     private static final String ARG_ACTIVITY_RECREATED = "activity_recreated";
 
@@ -273,6 +278,12 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
             mIsInvalidState = true;
             return;
         }
+
+        // Request the notification permission on Android 13+ so that program notifications
+        // (OSC 9, OSC 777, OSC 99) can be shown. Without the grant, the OS drops them.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+            PermissionUtils.requestPermission(this, Manifest.permission.POST_NOTIFICATIONS,
+                REQUEST_GRANT_POST_NOTIFICATIONS_PERMISSION);
 
         // Send the {@link TermuxConstants#BROADCAST_TERMUX_OPENED} broadcast to notify apps that Termux
         // app has been opened.

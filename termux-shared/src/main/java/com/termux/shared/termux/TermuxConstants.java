@@ -848,6 +848,11 @@ public final class TermuxConstants {
     /** Termux app unique notification id used by {@link TERMUX_APP.TERMUX_SERVICE} */
     public static final int TERMUX_APP_NOTIFICATION_ID = 1337;
 
+    /** Termux app notification channel id used for notifications posted on behalf of terminal programs */
+    public static final String TERMUX_APP_PROGRAM_NOTIFICATION_CHANNEL_ID = "termux_program_notification_channel";
+    /** Termux app notification channel name used for notifications posted on behalf of terminal programs */
+    public static final String TERMUX_APP_PROGRAM_NOTIFICATION_CHANNEL_NAME = TermuxConstants.TERMUX_APP_NAME + " Program Notifications";
+
     /** Termux app notification channel id used by {@link TERMUX_APP.RUN_COMMAND_SERVICE} */
     public static final String TERMUX_RUN_COMMAND_NOTIFICATION_CHANNEL_ID = "termux_run_command_notification_channel";
     /** Termux app notification channel name used by {@link TERMUX_APP.RUN_COMMAND_SERVICE} */
