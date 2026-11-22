@@ -1005,6 +1005,8 @@ public final class TerminalView extends View {
             // maintained after opening/closing soft keyboard.
             int topRow = 0;
             if (mEmulator != null) {
+                // The kitty animation tick asks what is on screen; give it the view's live top row.
+                mEmulator.setTopRowProvider(() -> mTopRow);
                 int rowsInHistory = mEmulator.getScreen().getActiveTranscriptRows();
                 int cachedTopRow = mEmulator.getTopRow();
                 if (cachedTopRow >= -rowsInHistory) {

@@ -47,4 +47,8 @@ public class Bitmap {
     public void recycle() {}
 
     public boolean isRecycled() { return false; }
+
+    public boolean hasMipMap() { return false; }
+
+    public void setHasMipMap(boolean hasMipMap) {}
 }

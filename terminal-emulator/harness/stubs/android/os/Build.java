@@ -8,6 +8,7 @@ public class Build {
     }
 
     public static class VERSION_CODES {
+        public static final int M = 23;
         public static final int VANILLA_ICE_CREAM = 35;
     }
 }
