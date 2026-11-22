@@ -37,3 +37,9 @@ local.properties
 .swp
 ehthumbs.db
 Thumbs.db
+
+# Claude Code session state (review scratch, agent worktrees)
+.claude/
+
+# JavaScript dependencies — the mpl-ext merge once shipped these by mistake
+node_modules/
