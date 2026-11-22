@@ -34,12 +34,12 @@ import java.util.Map;
  * to put on the clipboard. Other types are answered {@code ENOSYS} rather than pretended, and so
  * is {@code loc=primary}, which Android does not have.
  *
- * <p>Paste events ({@code CSI ? 5522 h}, kept by the emulator): when the user pastes, the program
- * is sent {@link #pasteEvent} — the types on offer and a single-use password — instead of the
- * text. A read that brings the password back with a {@code name} is the program fetching that
- * paste, and is passed to {@link Handler#read} as consented. Every other read goes through the
- * same launcher gates as {@code OSC 52}; the {@code pw}/{@code name} permission cache beyond that
- * is not implemented.
+ * <p>Paste events ({@code CSI ? 5522 h}, tracked by the emulator): with the mode set,
+ * {@link TerminalEmulator#paste} answers a user paste with {@link #pasteEvent} — the types on
+ * offer and a single-use password — and writes no text to the pty. A read that brings the
+ * password back with a {@code name} is the program fetching that paste, and is passed to
+ * {@link Handler#read} as consented. Every other read goes through the same launcher gates as
+ * {@code OSC 52}; the {@code pw}/{@code name} permission cache beyond that is not implemented.
  *
  * <p>The class only parses and answers; the actual clipboard belongs to the {@link Handler}.
  */
@@ -84,11 +84,18 @@ public final class KittyClipboard {
     /** Most decoded data a write may build up. The spec asks terminals for at least 64 MiB. */
     static final int MAX_WRITE_BYTES = 64 * 1024 * 1024;
 
+    /**
+     * Most base64 characters one OSC 5522 packet may carry. The packet lives in the terminal's
+     * arg buffer as UTF-16 before decode, so a hostile packet must not be able to commit the
+     * heap to the full 64 MiB write at once; a real write sends many packets anyway.
+     */
+    static final int MAX_PACKET_CHARS = 4 * 1024 * 1024;
+
     /** The type a read asks with to list the types instead; the paste event lists under it too. */
     private static final String LISTING = ".";
 
-    private static final String TEXT_PLAIN = "text/plain";
-    private static final String TEXT_PLAIN_UTF8 = "text/plain;charset=utf-8";
+    static final String TEXT_PLAIN = "text/plain";
+    static final String TEXT_PLAIN_UTF8 = "text/plain;charset=utf-8";
 
     /** True between {@code type=write} and its closing {@code wdata}. */
     private boolean mWriting;

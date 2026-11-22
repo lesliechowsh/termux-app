@@ -63,17 +63,17 @@ public final class KittyUnicodePlaceholder {
         public final int column;
         public final int imageIdHighByte;
         final int foregroundColor;
-        final int underlineColor;
+        final int backgroundColor;
 
         private Cell(long imageId, long placementId, int row, int column, int imageIdHighByte,
-                     int foregroundColor, int underlineColor) {
+                     int foregroundColor, int backgroundColor) {
             this.imageId = imageId;
             this.placementId = placementId;
             this.row = row;
             this.column = column;
             this.imageIdHighByte = imageIdHighByte;
             this.foregroundColor = foregroundColor;
-            this.underlineColor = underlineColor;
+            this.backgroundColor = backgroundColor;
         }
     }
 
@@ -85,11 +85,11 @@ public final class KittyUnicodePlaceholder {
 
     /**
      * Decode the combining-code-point portion of one placeholder grapheme. The foreground encodes
-     * the low 24 image-id bits, and the underline color encodes the placement id. The terminal's
+     * the low 24 image-id bits, and the background color encodes the placement id. The terminal's
      * default-color sentinel must be supplied because it is not a protocol id.
      */
     public static Cell decode(char[] text, int start, int end, int foregroundColor,
-                              int underlineColor, int defaultColor, Cell previous) {
+                              int backgroundColor, int defaultColor, Cell previous) {
         if (text == null || start < 0 || end < start || end > text.length) return null;
         int[] values = {-1, -1, -1};
         int count = 0;
@@ -103,7 +103,7 @@ public final class KittyUnicodePlaceholder {
 
         int lowImageId = colorValue(foregroundColor, defaultColor);
         if (lowImageId < 0) return null;
-        int placementId = colorValue(underlineColor, defaultColor);
+        int placementId = colorValue(backgroundColor, defaultColor);
         if (placementId < 0) placementId = 0;
 
         int row = values[0];
@@ -111,7 +111,7 @@ public final class KittyUnicodePlaceholder {
         int highByte = values[2];
         boolean sameColors = previous != null
             && previous.foregroundColor == foregroundColor
-            && previous.underlineColor == underlineColor;
+            && previous.backgroundColor == backgroundColor;
         if (count == 0 && sameColors) {
             row = previous.row;
             column = previous.column + 1;
@@ -128,7 +128,7 @@ public final class KittyUnicodePlaceholder {
         if (highByte > 0xff) return null;
         long imageId = (lowImageId & 0x00ffffffL) | ((long) highByte << 24);
         return new Cell(imageId, placementId & 0x00ffffffL, row, column, highByte,
-            foregroundColor, underlineColor);
+            foregroundColor, backgroundColor);
     }
 
     private static int colorValue(int color, int defaultColor) {

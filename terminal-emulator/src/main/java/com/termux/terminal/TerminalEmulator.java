@@ -188,6 +188,10 @@ public final class TerminalEmulator {
     private static final int ESC_APC_IGNORE = 29;
     /** ESC seen while in {@link #ESC_APC_IGNORE}. */
     private static final int ESC_APC_IGNORE_ESCAPE = 30;
+    /** Absorbing an oversized/refused OSC 5522 packet silently up to ST. */
+    private static final int ESC_OSC_IGNORE = 31;
+    /** ESC seen while in {@link #ESC_OSC_IGNORE}. */
+    private static final int ESC_OSC_IGNORE_ESCAPE = 32;
 
     /** The number of parameter arguments including colon separated sub-parameters. */
     private static final int MAX_ESCAPE_PARAMETERS = 32;
@@ -233,6 +237,8 @@ public final class TerminalEmulator {
     private static final int DECSET_BIT_LEFTRIGHT_MARGIN_MODE = 1 << 11;
     /** Not really DECSET bit... - http://www.vt100.net/docs/vt510-rm/DECSACE */
     private static final int DECSET_BIT_RECTANGULAR_CHANGEATTRIBUTE = 1 << 12;
+    /** DECSET 5522 - kitty paste events: {@link #paste} tells the program instead of writing the text. */
+    private static final int DECSET_BIT_PASTE_EVENTS = 1 << 13;
 
 
     private String mTitle;
@@ -510,6 +516,8 @@ public final class TerminalEmulator {
                 return DECSET_BIT_MOUSE_PROTOCOL_SGR;
             case 2004:
                 return DECSET_BIT_BRACKETED_PASTE_MODE;
+            case 5522:
+                return DECSET_BIT_PASTE_EVENTS;
             default:
                 return -1;
             // throw new IllegalArgumentException("Unsupported decset: " + decsetBit);
@@ -902,6 +910,12 @@ public final class TerminalEmulator {
             return;
         } else if (mEscapeState == ESC_APC_IGNORE_ESCAPE) {
             receiveApcIgnoreEsc(b);
+            return;
+        } else if (mEscapeState == ESC_OSC_IGNORE) {
+            receiveOscIgnore(b);
+            return;
+        } else if (mEscapeState == ESC_OSC_IGNORE_ESCAPE) {
+            receiveOscIgnoreEsc(b);
             return;
         }
 
@@ -1997,6 +2011,9 @@ public final class TerminalEmulator {
             case 2004:
                 // Bracketed paste mode - setting bit is enough.
                 break;
+            case 5522:
+                // Kitty paste events - setting bit is enough; paste() consults it.
+                break;
             default:
                 unknownParameter(externalBit);
                 break;
@@ -2133,6 +2150,27 @@ public final class TerminalEmulator {
         } else {
             mApcSequenceLength += 2;
             continueSequence(ESC_APC_IGNORE);
+        }
+    }
+
+    /** Discard the rest of an oversized/refused OSC 5522 packet up to its String Terminator. */
+    private void receiveOscIgnore(final int b) {
+        if (b == 27) {
+            continueSequence(ESC_OSC_IGNORE_ESCAPE);
+        } else if (++mApcSequenceLength > MAX_APC_ABSORB_LENGTH) {
+            // The same runaway safety net as an APC absorb: an unterminated packet cannot eat
+            // the session forever.
+            finishSequence();
+        }
+    }
+
+    /** ESC seen while absorbing an OSC 5522 packet. */
+    private void receiveOscIgnoreEsc(final int b) {
+        if (b == '\\') {
+            finishSequence();
+        } else {
+            mApcSequenceLength += 2;
+            continueSequence(ESC_OSC_IGNORE);
         }
     }
 
@@ -3100,11 +3138,12 @@ public final class TerminalEmulator {
                         /* `1337;File=inline=1;size=209715200;name=xxxxxxxxxxxxxxxxxxxxxxxx;width=8192px;height=8192px;preserveAspectRatio=1:` */ 150;
                     break;
                 case 5522:
-                    // Kitty extended clipboard write payloads are base64 in the args, and a
-                    // write may carry `MAX_WRITE_BYTES` of decoded data. Refusing one
-                    // mid-packet would finish the sequence and print the rest of the base64
-                    // on the screen.
-                    terminalControlArgsMaxLength = (KittyClipboard.MAX_WRITE_BYTES / 3 + 1) * 4 +
+                    // One packet may carry a few MiB of base64, not the whole 64 MiB write: the
+                    // arg buffer holds the packet as UTF-16 before decode, so a hostile packet
+                    // must not be able to commit the heap to the full write at once. A real
+                    // write sends many wdata packets, which KittyClipboard accumulates, so
+                    // legitimate large transfers never come near this per-packet cap.
+                    terminalControlArgsMaxLength = KittyClipboard.MAX_PACKET_CHARS +
                         /* `5522;type=write:mime=..:pw=..:id=..;` */ 256;
                     break;
                 case 99:
@@ -3581,7 +3620,15 @@ public final class TerminalEmulator {
         }
 
         clearTerminalControlArgs();
-        finishSequence();
+        // A refused kitty clipboard packet absorbs to its ST like an APC does: finishing the
+        // sequence here would print the rest of its base64 on the screen. Only 5522 gets this;
+        // every other sequence keeps the long-standing overflow behavior.
+        if (mOscType == 5522) {
+            mApcSequenceLength = 0;
+            continueSequence(ESC_OSC_IGNORE);
+        } else {
+            finishSequence();
+        }
         return false;
     }
 
@@ -3960,8 +4007,22 @@ public final class TerminalEmulator {
         }
     }
 
-    /** If DECSET 2004 is set, prefix paste with "\033[200~" and suffix with "\033[201~". */
+    /**
+     * Paste into the terminal: with DECSET 5522 set, tell the program of the paste with a kitty
+     * paste event so it reads the text off the clipboard itself; otherwise write the text, wrapped
+     * in "\033[200~"/"\033[201~" if DECSET 2004 is set.
+     */
     public void paste(String text) {
+        // Kitty paste-events mode (DECSET 5522): the user's paste is the program's consent to
+        // read it, so the program is told with a password and fetches the text itself; nothing
+        // goes down the pty.
+        if (isDecsetInternalBitSet(DECSET_BIT_PASTE_EVENTS)) {
+            mKittyClipboard.pasteEvent(java.util.Arrays.asList(
+                KittyClipboard.TEXT_PLAIN, KittyClipboard.TEXT_PLAIN_UTF8),
+                System.currentTimeMillis(), mKittyClipboardHandler);
+            return;
+        }
+
         // First: Always remove escape key and C1 control characters [0x80,0x9F]:
         text = text.replaceAll("(\u001B|[\u0080-\u009F])", "");
         // Second: Replace all newlines (\n) or CRLF (\r\n) with carriage returns (\r).

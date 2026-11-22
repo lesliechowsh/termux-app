@@ -298,6 +298,52 @@ public class KittyGraphicsTransmitTest extends KittyGraphicsTestCase {
         assertTrue(out.generation > 0);
     }
 
+    public void testUnicodePlaceholderCellBackgroundResolvesTheVirtualPlacement() {
+        // kitty encodes the image id in a placeholder cell's fg and the virtual placement id in
+        // its bg, so a cell resolves through its background. The decode calls below mirror
+        // TerminalRenderer's decode call; terminal-view is outside this harness, so this is
+        // where that argument contract is pinned.
+        enterString(apc("a=T,i=5,U=1,p=3,c=1,r=1,f=24,s=1,v=1;" + base64(1, 2, 3)));
+        assertEquals(reply("i=5,p=3", "OK"), mOutput.getOutputAndClear());
+        assertTrue(mTerminal.hasKittyVirtualPlacement(5, 3));
+        // One U+10EEEE cell carrying row 0, column 0 (Diacritics[0], Diacritics[0]).
+        char[] cell = (new String(Character.toChars(KittyUnicodePlaceholder.CODE_POINT))
+            + "̅̅").toCharArray();
+        enterString("\033[38;2;0;0;5;48;2;0;0;3m"); // fg = image id 5, bg = placement id 3.
+        enterString(new String(cell));
+        // The placeholder sits at chars 0..3 of the row text: two surrogate chars, then the
+        // two diacritics decode() reads.
+        char[] line = mTerminal.getScreen().allocateFullLineIfNecessary(
+            mTerminal.getScreen().externalToInternalRow(0)).mText;
+        KittyUnicodePlaceholder.Cell decoded = KittyUnicodePlaceholder.decode(
+            line, 2, 4, TextStyle.decodeForeColor(getStyleAt(0, 0)),
+            TextStyle.decodeBackColor(getStyleAt(0, 0)), TextStyle.COLOR_INDEX_FOREGROUND, null);
+        assertEquals(5, decoded.imageId);
+        assertEquals(3, decoded.placementId);
+        KittyImagePlaceholder placement3 = new KittyImagePlaceholder();
+        assertTrue(mTerminal.getKittyImagePlaceholder(5, 3, placement3));
+        assertEquals(1, placement3.columns); // the p=3 registration asked for c=1
+        // A second cell with a different background resolves differently: bg 4 names no virtual
+        // placement, so nothing resolves. A default bg decodes to placement id 0, whose lookup
+        // answers the image's first virtual placement — the documented fallback.
+        enterString("\033[0;38;2;0;0;5;48;2;0;0;4m"); // Reset, then fg = image id 5, bg = 4.
+        enterString(new String(cell));
+        KittyUnicodePlaceholder.Cell unregistered = KittyUnicodePlaceholder.decode(
+            line, 2, 4, TextStyle.decodeForeColor(getStyleAt(0, 1)),
+            TextStyle.decodeBackColor(getStyleAt(0, 1)), TextStyle.COLOR_INDEX_FOREGROUND, null);
+        assertEquals(4, unregistered.placementId);
+        assertFalse(mTerminal.getKittyImagePlaceholder(5, 4, new KittyImagePlaceholder()));
+        enterString("\033[0;38;2;0;0;5m"); // Reset, then fg = image id 5, default bg.
+        enterString(new String(cell));
+        KittyUnicodePlaceholder.Cell defaultBg = KittyUnicodePlaceholder.decode(
+            line, 2, 4, TextStyle.decodeForeColor(getStyleAt(0, 2)),
+            TextStyle.decodeBackColor(getStyleAt(0, 2)), TextStyle.COLOR_INDEX_FOREGROUND, null);
+        assertEquals(0, defaultBg.placementId);
+        KittyImagePlaceholder fallback = new KittyImagePlaceholder();
+        assertTrue(mTerminal.getKittyImagePlaceholder(5, 0, fallback));
+        assertEquals(1, fallback.columns); // the first virtual placement, the p=3 c=1 one
+    }
+
     public void testUnicodePlacementModeTwoIsUnsupported() {
         enterString(apc("a=t,i=5,U=2,f=24,s=1,v=1;" + base64(1, 2, 3)));
         assertEquals(reply("i=5", "EINVAL:unsupported unicode placeholder mode"), mOutput.getOutputAndClear());
