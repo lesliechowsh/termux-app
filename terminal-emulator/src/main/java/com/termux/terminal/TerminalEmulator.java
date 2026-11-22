@@ -1,5 +1,8 @@
 package com.termux.terminal;
 
+import java.util.Map;
+
+import android.graphics.Bitmap;
 import android.util.Base64;
 
 import java.nio.charset.StandardCharsets;
@@ -165,15 +168,35 @@ public final class TerminalEmulator {
      * - https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-Application-Program-Command-functions
      */
     private static final int ESC_APC = 20;
+    /** Length counter for the current APC (also reused as absorb counter). */
+    private int mApcSequenceLength;
+    /** True while the current APC started with 'G' — kitty graphics. */
+    private boolean mApcKitty;
+    /** True once a kitty APC chose the buffered path. */
+    private boolean mApcKittyBuffered;
     /** Escape processing: `ESC` received while receiving a {@link #ESC_APC} command.  */
     private static final int ESC_APC__ESC = 21;
     /** Escape processing: ESC [ <parameter bytes> */
     private static final int ESC_CSI_UNSUPPORTED_PARAMETER_BYTE = 22;
     /** Escape processing: ESC [ <parameter bytes> <intermediate bytes> */
     private static final int ESC_CSI_UNSUPPORTED_INTERMEDIATE_BYTE = 23;
+    /** Inside a kitty graphics APC past the ';': payload streams straight to the protocol layer. */
+    private static final int ESC_APC_KITTY_PAYLOAD = 27;
+    /** ESC seen while in {@link #ESC_APC_KITTY_PAYLOAD}. */
+    private static final int ESC_APC_KITTY_PAYLOAD_ESCAPE = 28;
+    /** Absorbing an oversized/refused APC silently up to ST. */
+    private static final int ESC_APC_IGNORE = 29;
+    /** ESC seen while in {@link #ESC_APC_IGNORE}. */
+    private static final int ESC_APC_IGNORE_ESCAPE = 30;
 
     /** The number of parameter arguments including colon separated sub-parameters. */
     private static final int MAX_ESCAPE_PARAMETERS = 32;
+
+    static final int MAX_STRING_SEQUENCE_LENGTH = 16 * 1024;
+    /** Buffered ceiling for kitty graphics control data + small payloads. */
+    static final int MAX_KITTY_BUFFERED_APC_LENGTH = 64 * 1024;
+    /** Runaway safety net while absorbing an oversized APC. */
+    private static final int MAX_APC_ABSORB_LENGTH = 64 * 1024 * 1024;
 
     /** DECSET 1 - application cursor keys. */
     private static final int DECSET_BIT_APPLICATION_CURSOR_KEYS = 1;
@@ -493,10 +516,75 @@ public final class TerminalEmulator {
         }
     }
 
+    /** The kitty graphics protocol state and image store. */
+    private final KittyGraphicsProtocol mKittyGraphics;
+
+    /** Desktop notifications a program asked for with {@code OSC 99}. */
+    private final KittyNotifications mKittyNotifications = new KittyNotifications();
+
+    /** The extended clipboard a program drives with {@code OSC 5522}; shares the OSC 52 callbacks. */
+    private final KittyClipboard mKittyClipboard = new KittyClipboard();
+
+    private final KittyClipboard.Handler mKittyClipboardHandler = new KittyClipboard.Handler() {
+        @Override
+        public void read(boolean pasted, KittyClipboard.ReadCallback callback) {
+            mSession.onReadClipboard(pasted, callback);
+        }
+
+        @Override
+        public void writeText(String text) {
+            mSession.onCopyTextToClipboard(text);
+        }
+
+        @Override
+        public void writeData(Map<String, byte[]> images, String text) {
+            mSession.onWriteClipboard(images, text);
+        }
+
+        @Override
+        public void write(String escapeSequence) {
+            mSession.write(escapeSequence);
+        }
+    };
+
+    private final KittyNotifications.Handler mKittyNotificationHandler = new KittyNotifications.Handler() {
+        @Override
+        public void show(KittyNotification notification) {
+            mSession.onKittyNotification(notification);
+        }
+
+        @Override
+        public void close(String id) {
+            mSession.onKittyNotificationClose(id);
+        }
+
+        @Override
+        public void write(String escapeSequence) {
+            mSession.write(escapeSequence);
+        }
+    };
+    /** Bumped whenever kitty placements change so the view can invalidate. */
+    long mKittyPlacementGeneration;
+    /** Bumped on every screen scroll so kitty can scroll-checkpoint placements. */
+    private long mScrollEventCount;
+    /** True while placeKittyGraphics is mutating placements (recursion guard). */
+    private boolean mPlacingKittyGraphics;
+    /** Whether any kitty cell has ever been drawn (view hook). */
+    private boolean mHasAnyKittyCell;
+
+    /** Test-facing overload matching the upstream JVM test suite signature. */
+    public TerminalEmulator(TerminalOutput session, boolean boldWithBright, int columns, int rows, int cellWidthPixels, int cellHeightPixels, Integer transcriptRows, TerminalSessionClient client) {
+        this(session, columns, rows, cellWidthPixels, cellHeightPixels, transcriptRows, client);
+    }
+
     public TerminalEmulator(TerminalOutput session, int columns, int rows, int cellWidthPixels, int cellHeightPixels, Integer transcriptRows, TerminalSessionClient client) {
         mSession = session;
         mScreen = mMainBuffer = new TerminalBuffer(client, columns, getTerminalTranscriptRows(transcriptRows), rows);
         mAltBuffer = new TerminalBuffer(client, columns, rows, rows);
+        mKittyGraphics = new KittyGraphicsProtocol(this, session);
+        TerminalBuffer.UnreachableImageListener collected = this::onKittyCellsCollected;
+        mMainBuffer.setUnreachableImageListener(collected);
+        mAltBuffer.setUnreachableImageListener(collected);
         mClient = client;
         mRows = rows;
         mColumns = columns;
@@ -686,8 +774,19 @@ public final class TerminalEmulator {
      * @param length the number of bytes in the array to process
      */
     public void append(byte[] buffer, int length) {
-        for (int i = 0; i < length; i++)
-            processByte(buffer[i]);
+        int i = 0;
+        while (i < length) {
+            // The kitty payload fast path: hand whole runs of plain ASCII to the streaming decoder.
+            if (mEscapeState == ESC_APC_KITTY_PAYLOAD && mUtf8ToFollow == 0) {
+                int start = i;
+                while (i < length && buffer[i] >= 32 && buffer[i] != 127) i++;
+                if (i > start && !mKittyGraphics.streamFeed(buffer, start, i - start)) {
+                    startApcAbsorb();
+                }
+                if (i >= length) return;
+            }
+            processByte(buffer[i++]);
+        }
     }
 
     private void processByte(byte byteToProcess) {
@@ -758,6 +857,14 @@ public final class TerminalEmulator {
     public void processCodePoint(int b) {
         mScreen.doTerminalBitmapsGC(300000);
 
+        // CAN and SUB cancel every escape string, including APC. APC is otherwise handled before
+        // the control-character switch because its payload may contain arbitrary control bytes.
+        if ((b == 24 || b == 26) && mEscapeState != ESC_NONE) {
+            finishSequence();
+            emitCodePoint(127);
+            return;
+        }
+
         if (mEscapeState == ESC_OSC && mIsFastPathOsc) {
             mContinueSequence = false;
             receiveOsc(b);
@@ -777,15 +884,24 @@ public final class TerminalEmulator {
         }
 
         // The Application Program-Control (APC) string might be arbitrary non-printable characters, so handle that early.
+        // kitty 序列跨多字节持续:状态保持直到 receiveApcEsc 遇到 ST 调 finishSequence(与 TL 一致)。
         if (mEscapeState == ESC_APC) {
-            mContinueSequence = false;
             receiveApc(b);
-            if (!mContinueSequence) mEscapeState = ESC_NONE;
             return;
         } else if (mEscapeState == ESC_APC__ESC) {
-            mContinueSequence = false;
             receiveApcEsc(b);
-            if (!mContinueSequence) mEscapeState = ESC_NONE;
+            return;
+        } else if (mEscapeState == ESC_APC_KITTY_PAYLOAD) {
+            receiveApcKittyPayload(b);
+            return;
+        } else if (mEscapeState == ESC_APC_KITTY_PAYLOAD_ESCAPE) {
+            receiveApcKittyPayloadEsc(b);
+            return;
+        } else if (mEscapeState == ESC_APC_IGNORE) {
+            receiveApcIgnore(b);
+            return;
+        } else if (mEscapeState == ESC_APC_IGNORE_ESCAPE) {
+            receiveApcIgnoreEsc(b);
             return;
         }
 
@@ -1855,6 +1971,8 @@ public final class TerminalEmulator {
                 // Reset: Use Normal Screen Buffer and restore cursor as in DECRC.
                 TerminalBuffer newScreen = setting ? mAltBuffer : mMainBuffer;
                 if (newScreen != mScreen) {
+                    mKittyGraphics.screenSwitched();
+                    if (mAltBuffer.deleteKittyImages(-1, true) > 0) mKittyPlacementGeneration++;
                     boolean resized = !(newScreen.mColumns == mColumns && newScreen.mScreenRows == mRows);
                     if (setting) saveCursor();
                     mScreen = newScreen;
@@ -1965,8 +2083,250 @@ public final class TerminalEmulator {
         }
     }
 
+
+    /** The buffered ceiling for the current APC: kitty commands get room, the rest the old bound. */
+    private int apcBufferLimit() {
+        return mApcKitty ? MAX_KITTY_BUFFERED_APC_LENGTH : MAX_STRING_SEQUENCE_LENGTH;
+    }
+
+    /** When streaming a kitty graphics payload ({@link #ESC_APC_KITTY_PAYLOAD}). */
+    private void receiveApcKittyPayload(final int b) {
+        if (b == 27) {
+            continueSequence(ESC_APC_KITTY_PAYLOAD_ESCAPE);
+        } else if (!mKittyGraphics.streamFeed(b)) {
+            startApcAbsorb();
+        }
+    }
+
+    /** ESC inside a streamed kitty payload: ST finishes; anything else is (invalid) payload. */
+    private void receiveApcKittyPayloadEsc(final int b) {
+        if (b == '\\') {
+            mKittyGraphics.finishStream();
+            finishSequence();
+            return;
+        }
+        if (!mKittyGraphics.streamFeed(27) || !mKittyGraphics.streamFeed(b)) {
+            startApcAbsorb();
+            return;
+        }
+        continueSequence(ESC_APC_KITTY_PAYLOAD);
+    }
+
+    /** Discard the rest of the current APC up to its String Terminator, printing nothing. */
+    private void startApcAbsorb() {
+        mTerminalControlArgs.setLength(0);
+        mApcSequenceLength = 0;
+        continueSequence(ESC_APC_IGNORE);
+    }
+
+    private void receiveApcIgnore(final int b) {
+        if (b == 27) {
+            continueSequence(ESC_APC_IGNORE_ESCAPE);
+        } else if (++mApcSequenceLength > MAX_APC_ABSORB_LENGTH) {
+            finishSequence();
+        }
+    }
+
+    private void receiveApcIgnoreEsc(final int b) {
+        if (b == '\\') {
+            finishSequence();
+        } else {
+            mApcSequenceLength += 2;
+            continueSequence(ESC_APC_IGNORE);
+        }
+    }
+
+    long scrollEventCount() {
+        return mScrollEventCount;
+    }
+    void noteKittyPlacementPixelsReplaced() {
+        mKittyPlacementGeneration++;
+    }
+    boolean placeKittyGraphics(Bitmap bitmap, boolean ownsBitmap, long ownedBytes,
+                               KittyGraphicsProtocol.Command command, long imageId, int row, int col,
+                               int[] source, int width, int height, int offsetX, int offsetY,
+                               int cellWidth, int cellHeight) {
+        // A picture taller than the screen may have pushed its own top row into the scrollback
+        // while the cursor moved past it; it is anchored there, as the text it came with is.
+        if (bitmap == null || row < -mScreen.getActiveTranscriptRows() || row >= mRows
+            || col < 0 || col >= mColumns)
+            return false;
+        mPlacingKittyGraphics = true;
+        try {
+            KittyPlacement placement = null;
+            long previousBytes = 0;
+            if (command.action == 'p') {
+                // Unidentified placements are additive, which is what makes several per image work.
+                if (command.placementId != 0) {
+                    placement = mScreen.findKittyPlacement(imageId, command.placementId);
+                    if (placement != null) previousBytes = placement.ownedBytes;
+                }
+            }
+            long addedBytes = ownsBitmap ? Math.max(0, ownedBytes) : 0;
+            // The byte budget is checked before anything is taken down: a refused placement
+            // must not take the picture it replaces with it. `previousBytes` covers whatever
+            // this command will remove, so the budget reads the same before and after it.
+            if (addedBytes > 0) {
+                if (command.action != 'p' && imageId != 0) {
+                    for (KittyPlacement replaced : kittyPlacementsFor(imageId))
+                        previousBytes += replaced.ownedBytes;
+                }
+                if (getKittyGraphicsBytes() - previousBytes + addedBytes > KittyGraphicsProtocol.MAX_DECODED_BYTES) {
+                    return false;
+                }
+            }
+            if (command.action == 'p') {
+                if (placement != null && placement.anchor != null)
+                    placement.anchor.removeKittyPlacement(placement);
+            } else if (imageId != 0) {
+                mMainBuffer.deleteKittyImages(imageId, true);
+                mAltBuffer.deleteKittyImages(imageId, true);
+            }
+            if (placement == null) placement = new KittyPlacement(imageId, command.placementId);
+            placement.bitmap = bitmap;
+            placement.ownsBitmap = ownsBitmap;
+            placement.ownedBytes = addedBytes;
+            placement.z = command.z;
+            placement.column = col;
+            placement.sourceX = source[0];
+            placement.sourceY = source[1];
+            placement.sourceWidth = source[2];
+            placement.sourceHeight = source[3];
+            placement.width = width;
+            placement.height = height;
+            placement.offsetX = offsetX;
+            placement.offsetY = offsetY;
+            placement.cellWidth = Math.max(1, cellWidth);
+            placement.cellHeight = Math.max(1, cellHeight);
+            placement.fitToColumns(mColumns);
+            placement.rows = Math.max(1, (height + offsetY + placement.cellHeight - 1) / placement.cellHeight);
+            mScreen.putKittyPlacement(placement, row);
+            mKittyPlacementGeneration++;
+            return true;
+        } finally {
+            mPlacingKittyGraphics = false;
+        }
+    }
+    boolean isKittyImageOnScreen(long imageId) {
+        if (mTopRowProvider == null) return true;
+        return mScreen.hasKittyImageInRows(imageId, mTopRowProvider.topRow(), mRows);
+    }
+    boolean isAnyKittyPlaceholderCellOnScreen() {
+        if (mTopRowProvider == null) return true;
+        return mScreen.hasKittyPlaceholderCellInRows(mTopRowProvider.topRow(), mRows);
+    }
+    boolean hasAnyKittyPlaceholderCell() {
+        return mMainBuffer.hasAnyKittyPlaceholderCell() || mAltBuffer.hasAnyKittyPlaceholderCell();
+    }
+    void deleteKittyImageEverywhere(long imageId) {
+        if (mMainBuffer.deleteKittyImages(imageId, true) + mAltBuffer.deleteKittyImages(imageId, true) > 0)
+            mKittyPlacementGeneration++;
+    }
+    void deleteVisibleKittyGraphics() {
+        if (mScreen.deleteKittyImages(-1, false) > 0) mKittyPlacementGeneration++;
+    }
+    void deleteAllKittyGraphics() {
+        if (mMainBuffer.deleteKittyImages(-1, true) + mAltBuffer.deleteKittyImages(-1, true) > 0)
+            mKittyPlacementGeneration++;
+    }
+    void advanceKittyGraphicsCursor(KittyGraphicsProtocol.Command command, int imageWidth, int imageHeight,
+                                    int row, int col, int cellWidth, int cellHeight) {
+        if (command.noCursorMovement) return;
+        int columns = Math.min(mColumns - col, (imageWidth + cellWidth - 1) / cellWidth);
+        int rows = (imageHeight + cellHeight - 1) / cellHeight;
+        int nextColumn = col + columns;
+        if (nextColumn < mColumns) {
+            rows--;
+        } else {
+            nextColumn = 0;
+        }
+        setCursorRowCol(row, col);
+        while (rows-- > 0) doLinefeed();
+        setCursorCol(nextColumn);
+    }
+    long getKittyGraphicsBytes() {
+        return mMainBuffer.getKittyImageBytes() + mAltBuffer.getKittyImageBytes();
+    }
+    public boolean getKittyImagePlaceholder(long imageId, long placementId,
+                                            KittyImagePlaceholder out) {
+        return mKittyGraphics.getPlaceholder(imageId, placementId, out);
+    }
+    public long getKittyImageGeneration(long imageId) {
+        return mKittyGraphics.imageGeneration(imageId);
+    }
+    public long getKittyPlacementGeneration() {
+        return mKittyPlacementGeneration;
+    }
+    private void onKittyCellsCollected() {
+        if (mPlacingKittyGraphics) return;
+        mKittyGraphics.dropFramesOfUnreachableImages();
+    }
+    public boolean isScreenUpdateHeld() {
+        // Mode 2026 synchronized updates are not modeled; the screen is never held.
+        return false;
+    }
+
+    /** The placements reaching into the given rows, for the renderer's layer pass. */
+    public void collectKittyPlacements(int topRow, int rowCount, java.util.List<KittyPlacement> out) {
+        mScreen.collectVisibleKittyPlacements(topRow, rowCount, out);
+    }
+
+    boolean hasKittyVirtualPlacement(long imageId, long placementId) {
+        return mKittyGraphics.hasVirtualPlacement(imageId, placementId);
+    }
+
+    public void shutdownKittyGraphics() {
+        mKittyGraphics.shutdown();
+    }
+
+    /** Tell a program in paste-events mode (DECSET 5522) that the user pasted. */
+    public void sendPasteEvent(java.util.List<String> mimeTypes) {
+        mKittyClipboard.pasteEvent(mimeTypes, System.currentTimeMillis(), mKittyClipboardHandler);
+    }
+
+    /** The user tapped a notification this terminal put up. */
+    public void kittyNotificationActivated(String id, int button) {
+        if (id == null) return;
+        String report = mKittyNotifications.activated(id, button);
+        if (report != null) mSession.write(report);
+    }
+
+    /** A notification this terminal put up went away without being tapped. */
+    public void kittyNotificationClosed(String id) {
+        if (id == null) return;
+        String report = mKittyNotifications.closed(id);
+        if (report != null) mSession.write(report);
+    }
+
+    public interface TopRowProvider {
+        int topRow();
+    }
+
+    private TopRowProvider mTopRowProvider;
+
+    public void setTopRowProvider(TopRowProvider provider) {
+        mTopRowProvider = provider;
+    }
+
+
+    /** Delete the kitty placements the filter matches on the current screen, returning them. */
+    java.util.List<KittyPlacement> deleteKittyPlacements(TerminalBuffer.KittyPlacementFilter filter,
+                                                         boolean includeScrollback) {
+        java.util.List<KittyPlacement> deleted = mScreen.deleteKittyImages(filter, includeScrollback);
+        if (!deleted.isEmpty()) mKittyPlacementGeneration++;
+        return deleted;
+    }
+
+    java.util.List<KittyPlacement> kittyPlacementsFor(long imageId) {
+        java.util.List<KittyPlacement> result = new java.util.ArrayList<>();
+        mMainBuffer.collectKittyPlacements(imageId, result);
+        mAltBuffer.collectKittyPlacements(imageId, result);
+        return result;
+    }
+
     private void startEscapeSequence() {
         mEscapeState = ESC;
+        mApcSequenceLength = 0;
         mArgIndex = 0;
         Arrays.fill(mArgs, -1);
         mArgsSubParamsBitSet = 0;
@@ -2201,6 +2561,7 @@ public final class TerminalEmulator {
                     case 2: // Erase all of the display - all lines are erased, changed to single-width, and the cursor does not
                         // move..
                         blockClear(0, 0, mColumns, mRows);
+                        mKittyGraphics.screenCleared();
                         break;
                     case 3: // Delete all lines saved in the scrollback buffer (xterm etc)
                         mMainBuffer.clearTranscript();
@@ -2592,31 +2953,48 @@ public final class TerminalEmulator {
      * Receive {@link #ESC_APC}. Check its docs for more info.
      */
     private void receiveApc(final int b) {
-        switch (b) {
-            case 27: // Escape.
-                continueSequence(ESC_APC__ESC);
-                break;
-            default:
-                if (!collectTerminalControlArgs(b)) return;
+        if (b == 27) {
+            continueSequence(ESC_APC__ESC);
+            return;
         }
+        if (mApcSequenceLength == 0 && b == 'G') mApcKitty = true;
+        if (++mApcSequenceLength > apcBufferLimit()) {
+            startApcAbsorb();
+            return;
+        }
+        if (mApcKitty && !mApcKittyBuffered && b == ';') {
+            switch (mKittyGraphics.beginStream(mTerminalControlArgs.length() > 0
+                    ? mTerminalControlArgs.substring(1) : "")) {
+                case KittyGraphicsProtocol.STREAM_UPLOAD:
+                    mTerminalControlArgs.setLength(0);
+                    continueSequence(ESC_APC_KITTY_PAYLOAD);
+                    return;
+                case KittyGraphicsProtocol.STREAM_REJECT:
+                    startApcAbsorb();
+                    return;
+                default:
+                    mApcKittyBuffered = true;
+                    break;
+            }
+        }
+        mTerminalControlArgs.appendCodePoint(b);
     }
 
     /**
      * Receive {@link #ESC_APC__ESC}. Check its docs for more info.
      */
     private void receiveApcEsc(final int b) {
-        switch (b) {
-            case '\\':
-                //doApc();
-                //clearApcTypeVariables();
-                break;
-            default:
-                // The ESC character was not followed by a \, so insert the ESC and
-                // the current character in arg buffer.
-                if (!collectTerminalControlArgs(27)) return;
-                if (!collectTerminalControlArgs(b)) return;
-                continueSequence(ESC_APC);
-                break;
+        if (b == '\\') {
+            // A String Terminator (ST), ending the APC escape sequence.
+            mKittyGraphics.accept(mTerminalControlArgs.toString());
+            finishSequence();
+        } else if (mApcSequenceLength > apcBufferLimit() - 2) {
+            startApcAbsorb();
+        } else {
+            mApcSequenceLength += 2;
+            mTerminalControlArgs.append('\033');
+            mTerminalControlArgs.appendCodePoint(b);
+            continueSequence(ESC_APC);
         }
     }
 
@@ -2721,6 +3099,20 @@ public final class TerminalEmulator {
                     terminalControlArgsMaxLength = TerminalBitmap.MAX_BITMAP_SIZE +
                         /* `1337;File=inline=1;size=209715200;name=xxxxxxxxxxxxxxxxxxxxxxxx;width=8192px;height=8192px;preserveAspectRatio=1:` */ 150;
                     break;
+                case 5522:
+                    // Kitty extended clipboard write payloads are base64 in the args, and a
+                    // write may carry `MAX_WRITE_BYTES` of decoded data. Refusing one
+                    // mid-packet would finish the sequence and print the rest of the base64
+                    // on the screen.
+                    terminalControlArgsMaxLength = (KittyClipboard.MAX_WRITE_BYTES / 3 + 1) * 4 +
+                        /* `5522;type=write:mime=..:pw=..:id=..;` */ 256;
+                    break;
+                case 99:
+                    // A desktop notification's body may run to `MAX_TEXT_LENGTH` of base64 in
+                    // one packet, plus `99;i=..:p=..:n=..:e=..;` metadata.
+                    terminalControlArgsMaxLength = (KittyNotifications.MAX_TEXT_LENGTH / 3 + 1) * 4 +
+                        /* `99;i=..:p=..:n=..:e=..;` */ 256;
+                    break;
             }
 
             if (terminalControlArgsCapacity != null) {
@@ -2772,6 +3164,26 @@ public final class TerminalEmulator {
         }
 
         switch (value) {
+            case // Kitty extended clipboard: "5522;type=read|write|wdata|walias;payload".
+            5522:
+                mKittyClipboard.handle(textParameter, bellOrStringTerminator, mKittyClipboardHandler);
+                break;
+            case 99:
+                // The rich desktop notification (OSC 99). May arrive in pieces.
+                mKittyNotifications.handle(textParameter, mKittyNotificationHandler);
+                break;
+            case 9:
+                // iTerm2's growl-style notification: 9;body. No title.
+                mSession.onNotification(null, textParameter);
+                break;
+            case 777: {
+                // rxvt-unicode's notification: 777;notify;title;body.
+                String[] parts = textParameter.split(";", 3);
+                if (parts.length >= 2 && "notify".equals(parts[0])) {
+                    mSession.onNotification(parts[1], parts.length > 2 ? parts[2] : "");
+                }
+                break;
+            }
             case 0: // Change icon name and window title to T.
             case 1: // Change icon name to T.
             case 2: // Change window title to T.
@@ -3064,6 +3476,7 @@ public final class TerminalEmulator {
 
     private void scrollDownOneLine() {
         mScrollCounter++;
+        mScrollEventCount++;
         long currentStyle = getStyle();
         if (mLeftMargin != 0 || mRightMargin != mColumns) {
             // Horizontal margin: Do not put anything into scroll history, just non-margin part of screen up.
@@ -3275,7 +3688,14 @@ public final class TerminalEmulator {
     }
 
     private void finishSequence() {
+        // A cancelled kitty payload stream (CAN/SUB, or a runaway absorb) must tell the protocol
+        // layer; finishing after a clean ST is a no-op because finishStream() already closed it.
+        if (mEscapeState == ESC_APC_KITTY_PAYLOAD || mEscapeState == ESC_APC_KITTY_PAYLOAD_ESCAPE)
+            mKittyGraphics.abortStream();
+        mApcKitty = false;
+        mApcKittyBuffered = false;
         mEscapeState = ESC_NONE;
+        mApcSequenceLength = 0;
     }
 
     /**
@@ -3484,10 +3904,13 @@ public final class TerminalEmulator {
 
     /** Reset terminal state so user can interact with it regardless of present state. */
     public void reset() {
+        mKittyGraphics.reset();
+        mKittyNotifications.reset();
+        mKittyClipboard.reset();
         setCursorStyle();
         mArgIndex = 0;
         mContinueSequence = false;
-        mEscapeState = ESC_NONE;
+        finishSequence();
         mInsertMode = false;
         mTopMargin = mLeftMargin = 0;
         mBottomMargin = mRows;

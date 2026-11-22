@@ -348,6 +348,16 @@ public final class TerminalBuffer {
                     skippedBlankLines = 0;
                 }
 
+                if (oldLine.mKittyPlacements != null) {
+                    java.util.ArrayList<KittyPlacement> carried = oldLine.mKittyPlacements;
+                    oldLine.mKittyPlacements = null;
+                    TerminalRow target = allocateFullLineIfNecessary(externalToInternalRow(currentOutputExternalRow));
+                    for (KittyPlacement placement : carried) {
+                        placement.fitToColumns(mColumns);
+                        target.addKittyPlacement(placement);
+                        if (placement.rows > mKittyMaxRows) mKittyMaxRows = placement.rows;
+                    }
+                }
                 int lastNonSpaceIndex = 0;
                 boolean justToCursor = false;
                 if (cursorAtThisRow || oldLine.mLineWrap) {
@@ -470,7 +480,9 @@ public final class TerminalBuffer {
             if(mLines[blankRow].mHasTerminalBitmap) {
                 removeScrolledOutTerminalBitmaps(blankRow);
             }
+            boolean hadKittyPlacements = mLines[blankRow].hasKittyPlacements();
             mLines[blankRow].clear(style);
+            if (hadKittyPlacements) notifyKittyCellsCollected();
         }
     }
 
@@ -765,5 +777,206 @@ public final class TerminalBuffer {
 
         mTerminalBitmapsLastGC = SystemClock.uptimeMillis();
     }
+
+    /**
+     * Anchor a kitty placement at a screen row. The placement is a layer over the cells, so nothing
+     * in the cells changes; it goes where the row goes.
+     */
+    void putKittyPlacement(KittyPlacement placement, int externalRow) {
+        TerminalRow anchor = allocateFullLineIfNecessary(externalToInternalRow(externalRow));
+        anchor.addKittyPlacement(placement);
+        placement.row = externalRow;
+        if (placement.rows > mKittyMaxRows) mKittyMaxRows = placement.rows;
+    }
+
+    /**
+     * The tallest placement this buffer has held, in rows: how far above the first row in view an
+     * anchor can be and still reach down into it. Only ever grows, which errs towards looking at a
+     * few rows too many.
+     */
+    private int mKittyMaxRows = 1;
+
+    /** Find the placement with this (image, placement) id pair anywhere in the buffer. */
+    KittyPlacement findKittyPlacement(long imageId, long placementId) {
+        for (int row = -getActiveTranscriptRows(); row < mScreenRows; row++) {
+            TerminalRow line = mLines[externalToInternalRow(row)];
+            if (line == null || line.mKittyPlacements == null) continue;
+            for (KittyPlacement placement : line.mKittyPlacements) {
+                if (placement.imageId == imageId && placement.placementId == placementId) {
+                    placement.row = row;
+                    return placement;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The placements that reach into the {@code rowCount} rows starting at external row
+     * {@code topRow}, in the order they were anchored row by row. Each one's {@link
+     * KittyPlacement#getRow()} is set to where its anchor is now. This is what the renderer draws.
+     */
+    public void collectVisibleKittyPlacements(int topRow, int rowCount, java.util.List<KittyPlacement> out) {
+        out.clear();
+        int firstRow = Math.max(-getActiveTranscriptRows(), topRow - mKittyMaxRows + 1);
+        int lastRow = Math.min(mScreenRows, topRow + rowCount);
+        for (int row = firstRow; row < lastRow; row++) {
+            TerminalRow line = mLines[externalToInternalRow(row)];
+            if (line == null || line.mKittyPlacements == null) continue;
+            for (KittyPlacement placement : line.mKittyPlacements) {
+                placement.row = row;
+                if (placement.intersectsRows(topRow, rowCount)) out.add(placement);
+            }
+        }
+    }
+
+    /**
+     * Whether any U+10EEEE placeholder cell survives anywhere in this buffer, scrollback included.
+     *
+     * <p>A virtual placement paints nothing itself: it is a prototype that placeholder cells point
+     * at, so an image placed that way is reachable exactly as long as one of those cells exists.
+     * The question asked here is deliberately the coarse one — <em>any</em> placeholder cell, not
+     * one naming a particular image — because that is enough to decide whether frames can go, and
+     * it needs neither the id decode nor the run-inheritance chain the renderer carries. Two
+     * animations on screen keep each other's frames alive until the last cell of either goes,
+     * which errs towards keeping pixels that are still being displayed.</p>
+     */
+    boolean hasAnyKittyPlaceholderCell() {
+        int firstRow = -getActiveTranscriptRows();
+        for (int row = firstRow; row < mScreenRows; row++) {
+            TerminalRow line = mLines[externalToInternalRow(row)];
+            if (line == null) continue;
+            char[] text = line.mText;
+            int used = line.getSpaceUsed();
+            for (int i = 0; i < used - 1; i++) {
+                if (text[i] == KITTY_PLACEHOLDER_HIGH && text[i + 1] == KITTY_PLACEHOLDER_LOW)
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The same coarse question as {@link #hasAnyKittyPlaceholderCell}, asked of the
+     * {@code rowCount} rows starting at external row {@code topRow} — what the user is looking at.
+     * A placeholder-displayed image cannot be located per image without decoding every cluster and
+     * carrying the run-inheritance chain, so an animation drawn that way plays on while any
+     * placeholder cell is on screen and stops flipping when none is.
+     */
+    boolean hasKittyPlaceholderCellInRows(int topRow, int rowCount) {
+        int firstRow = Math.max(-getActiveTranscriptRows(), topRow);
+        int lastRow = Math.min(mScreenRows, topRow + rowCount);
+        for (int row = firstRow; row < lastRow; row++) {
+            TerminalRow line = mLines[externalToInternalRow(row)];
+            if (line == null) continue;
+            char[] text = line.mText;
+            int used = line.getSpaceUsed();
+            for (int i = 0; i < used - 1; i++) {
+                if (text[i] == KITTY_PLACEHOLDER_HIGH && text[i + 1] == KITTY_PLACEHOLDER_LOW)
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    /** U+10EEEE as a surrogate pair, which is how it sits in a row's char array. */
+    private static final char KITTY_PLACEHOLDER_HIGH =
+        Character.highSurrogate(KittyUnicodePlaceholder.CODE_POINT);
+    private static final char KITTY_PLACEHOLDER_LOW =
+        Character.lowSurrogate(KittyUnicodePlaceholder.CODE_POINT);
+
+    /**
+     * Whether any placement of {@code imageId} reaches into the {@code rowCount} rows starting at
+     * external row {@code topRow} — what the user is actually looking at. Rows without an anchor
+     * cost one field read, so this is cheap enough to ask on every animation frame.
+     */
+    boolean hasKittyImageInRows(long imageId, int topRow, int rowCount) {
+        int firstRow = Math.max(-getActiveTranscriptRows(), topRow - mKittyMaxRows + 1);
+        int lastRow = Math.min(mScreenRows, topRow + rowCount);
+        for (int row = firstRow; row < lastRow; row++) {
+            TerminalRow line = mLines[externalToInternalRow(row)];
+            if (line == null || line.mKittyPlacements == null) continue;
+            for (KittyPlacement placement : line.mKittyPlacements) {
+                placement.row = row;
+                if (placement.imageId == imageId && placement.intersectsRows(topRow, rowCount))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    /** Collect the live placements of one kitty image, for animation frame flips. */
+    void collectKittyPlacements(long imageId, java.util.List<KittyPlacement> out) {
+        for (int row = -getActiveTranscriptRows(); row < mScreenRows; row++) {
+            TerminalRow line = mLines[externalToInternalRow(row)];
+            if (line == null || line.mKittyPlacements == null) continue;
+            for (KittyPlacement placement : line.mKittyPlacements) {
+                if (placement.imageId == imageId) {
+                    placement.row = row;
+                    out.add(placement);
+                }
+            }
+        }
+    }
+
+    /** Bytes owned by kitty placements in this buffer; a placement of a stored image owns none. */
+    public long getKittyImageBytes() {
+        long result = 0;
+        for (TerminalRow line : mLines) {
+            if (line == null || line.mKittyPlacements == null) continue;
+            for (KittyPlacement placement : line.mKittyPlacements) result += placement.ownedBytes;
+        }
+        return result;
+    }
+
+    /** Selects kitty placements for deletion. Receives the anchor's external row (negative in scrollback). */
+    public interface KittyPlacementFilter {
+        boolean matches(KittyPlacement placement, int externalRow);
+    }
+
+    /** Delete kitty placements, either only those reaching the screen or also the scrollback's. A negative id matches all images. */
+    public int deleteKittyImages(long imageId, boolean includeScrollback) {
+        return deleteKittyImages((placement, row) ->
+            imageId < 0 || placement.imageId == imageId, includeScrollback).size();
+    }
+
+    /**
+     * Delete every placement the filter matches and return them. Without {@code includeScrollback}
+     * only placements that reach into the screen are considered, which includes one whose anchor
+     * has scrolled just above it.
+     */
+    public java.util.List<KittyPlacement> deleteKittyImages(KittyPlacementFilter filter, boolean includeScrollback) {
+        java.util.List<KittyPlacement> deleted = new java.util.ArrayList<>();
+        for (int row = -getActiveTranscriptRows(); row < mScreenRows; row++) {
+            TerminalRow line = mLines[externalToInternalRow(row)];
+            if (line == null || line.mKittyPlacements == null) continue;
+            for (int i = line.mKittyPlacements.size() - 1; i >= 0; i--) {
+                KittyPlacement placement = line.mKittyPlacements.get(i);
+                placement.row = row;
+                if (!includeScrollback && !placement.intersectsRows(0, mScreenRows)) continue;
+                if (!filter.matches(placement, row)) continue;
+                line.removeKittyPlacement(placement);
+                deleted.add(placement);
+            }
+        }
+        if (!deleted.isEmpty()) notifyKittyCellsCollected();
+        return deleted;
+    }
+
+
+    interface UnreachableImageListener {
+        void onKittyCellsCollected();
+    }
+
+    private UnreachableImageListener mUnreachableImageListener;
+
+    void setUnreachableImageListener(UnreachableImageListener listener) {
+        mUnreachableImageListener = listener;
+    }
+
+    private void notifyKittyCellsCollected() {
+        if (mUnreachableImageListener != null) mUnreachableImageListener.onKittyCellsCollected();
+    }
+
 
 }

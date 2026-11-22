@@ -149,6 +149,9 @@ public final class TerminalRow {
         mSpaceUsed = mColumns;
         mHasNonOneWidthOrSurrogateChars = false;
         mHasTerminalBitmap = false;
+        // The placements go with the line they were anchored to: a cleared row kept rendering
+        // them on whatever the recycled slot held next.
+        dropKittyPlacements();
     }
 
     // https://github.com/steven676/Android-Terminal-Emulator/commit/9a47042620bec87617f0b4f5d50568535668fe26
@@ -277,7 +280,50 @@ public final class TerminalRow {
         }
     }
 
+    java.util.ArrayList<KittyPlacement> mKittyPlacements;
+
+    public boolean hasKittyPlacements() {
+        return mKittyPlacements != null && !mKittyPlacements.isEmpty();
+    }
+
+
+    void addKittyPlacement(KittyPlacement placement) {
+        if (mKittyPlacements == null) mKittyPlacements = new java.util.ArrayList<>(2);
+        mKittyPlacements.add(placement);
+        placement.anchor = this;
+    }
+
+
+    void removeKittyPlacement(KittyPlacement placement) {
+        if (mKittyPlacements != null && mKittyPlacements.remove(placement)
+            && mKittyPlacements.isEmpty())
+            mKittyPlacements = null;
+        if (placement.anchor == this) placement.anchor = null;
+    }
+
+
+    boolean dropKittyPlacements() {
+        if (mKittyPlacements == null) return false;
+        for (KittyPlacement placement : mKittyPlacements) placement.anchor = null;
+        mKittyPlacements = null;
+        return true;
+    }
+
+
+    public int getDisplayWidthAt(int charIndex) {
+        char c = mText[charIndex];
+        if (Character.isHighSurrogate(c)) return 2;
+        return WcWidth.width(c);
+    }
+
+    boolean hasTextSizes() {
+        // Kitty text sizing (OSC 66) is not modeled; no row ever carries a size record.
+        return false;
+    }
+
     boolean isBlank() {
+        // A picture anchored here is content even over blank cells: a resize must not drop the row.
+        if (mKittyPlacements != null && !mKittyPlacements.isEmpty()) return false;
         for (int charIndex = 0, charLen = getSpaceUsed(); charIndex < charLen; charIndex++)
             if (mText[charIndex] != ' ') return false;
         return true;

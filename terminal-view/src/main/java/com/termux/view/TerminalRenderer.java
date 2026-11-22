@@ -1,5 +1,8 @@
 package com.termux.view;
 
+import com.termux.terminal.KittyImagePlaceholder;
+import com.termux.terminal.KittyUnicodePlaceholder;
+
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Paint;
@@ -21,6 +24,14 @@ import com.termux.terminal.WcWidth;
  * Saves font metrics, so needs to be recreated each time the typeface or font size changes.
  */
 public final class TerminalRenderer {
+
+    private final KittyImagePlaceholder mKittyPlaceholder = new KittyImagePlaceholder();
+    private final Rect mKittySrcRect = new Rect();
+    private final RectF mKittyDstRect = new RectF();
+    private final Paint mKittyPaint = new Paint(Paint.FILTER_BITMAP_FLAG);
+    private final KittyLayerPainter mKittyLayer = new KittyLayerPainter();
+    private final KittyLayerPainter.CanvasTarget mKittyLayerTarget = new KittyLayerPainter.CanvasTarget();
+
 
     final int mTextSize;
     final Typeface mTypeface;
@@ -73,6 +84,8 @@ public final class TerminalRenderer {
         if (reverseVideo)
             canvas.drawColor(palette[TextStyle.COLOR_INDEX_FOREGROUND], PorterDuff.Mode.SRC);
 
+        mKittyLayer.collect(mEmulator, topRow, Math.max(0, endRow - topRow));
+
         float heightOffset = mFontLineSpacingAndAscent;
         for (int row = topRow; row < endRow; row++) {
             heightOffset += mFontLineSpacing;
@@ -96,6 +109,8 @@ public final class TerminalRenderer {
             boolean lastRunFontWidthMismatch = false;
             int currentCharIndex = 0;
             float measuredWidthForRun = 0.f;
+            // The last decoded placeholder cell of this row, for kitty's run-inheritance form.
+            KittyUnicodePlaceholder.Cell placeholderRun = null;
 
             for (int column = 0; column < columns; ) {
                 final char charAtIndex = line[currentCharIndex];
@@ -104,6 +119,7 @@ public final class TerminalRenderer {
                 final int codePoint = charIsHighsurrogate ? Character.toCodePoint(charAtIndex, line[currentCharIndex + 1]) : charAtIndex;
                 final long style = lineObject.getStyle(column);
                 if (TextStyle.isTerminalBitmap(style)) {
+                    placeholderRun = null;
                     Bitmap bitmap = mEmulator.getScreen().getSixelBitmap(style);
                     if (bitmap != null) {
                         float left = column * mFontWidth;
@@ -122,6 +138,46 @@ public final class TerminalRenderer {
                     currentCharIndex += charsForCodePoint;
                     continue;
                 }
+                if (codePoint == KittyUnicodePlaceholder.CODE_POINT) {
+                    // kitty unicode placeholder: renderer control data, not a glyph.
+                    int clusterEnd = currentCharIndex + charsForCodePoint;
+                    while (clusterEnd < charsUsedInLine
+                           && KittyUnicodePlaceholder.diacriticValue(Character.codePointAt(line, clusterEnd, charsUsedInLine)) >= 0) {
+                        clusterEnd += Character.charCount(Character.codePointAt(line, clusterEnd, charsUsedInLine));
+                    }
+                    // The cell fg carries the low 24 image-id bits. This emulator keeps no
+                    // underline color in the cell style, so the placement id is unknown: passing
+                    // the default-color sentinel makes decode fall back to placement id 0, which
+                    // resolves to the image's first virtual placement. A default fg (the same
+                    // sentinel) encodes no id, and decode answers null.
+                    KittyUnicodePlaceholder.Cell cell = KittyUnicodePlaceholder.decode(
+                        line, currentCharIndex + charsForCodePoint, clusterEnd,
+                        TextStyle.decodeForeColor(style), TextStyle.COLOR_INDEX_FOREGROUND,
+                        TextStyle.COLOR_INDEX_FOREGROUND, placeholderRun);
+                    placeholderRun = cell;
+                    if (cell != null && mEmulator.getKittyImagePlaceholder(cell.imageId, cell.placementId, mKittyPlaceholder)
+                        && mKittyPlaceholder.bitmap != null && mKittyPlaceholder.columns > 0 && mKittyPlaceholder.rows > 0) {
+                        float left = column * mFontWidth;
+                        float top = heightOffset - mFontLineSpacing;
+                        mKittySrcRect.set(
+                            (int) ((long) mKittyPlaceholder.sourceX + (long) mKittyPlaceholder.sourceWidth * cell.column / mKittyPlaceholder.columns),
+                            (int) ((long) mKittyPlaceholder.sourceY + (long) mKittyPlaceholder.sourceHeight * cell.row / mKittyPlaceholder.rows),
+                            (int) ((long) mKittyPlaceholder.sourceX + (long) mKittyPlaceholder.sourceWidth * (cell.column + 1) / mKittyPlaceholder.columns),
+                            (int) ((long) mKittyPlaceholder.sourceY + (long) mKittyPlaceholder.sourceHeight * (cell.row + 1) / mKittyPlaceholder.rows));
+                        mKittyDstRect.set(left, top, left + mFontWidth, top + mFontLineSpacing);
+                        canvas.drawBitmap(mKittyPlaceholder.bitmap, mKittySrcRect, mKittyDstRect, mKittyPaint);
+                    }
+                    column += 1;
+                    currentCharIndex = clusterEnd;
+                    measuredWidthForRun = 0.f;
+                    lastRunStyle = 0;
+                    lastRunInsideCursor = false;
+                    lastRunStartColumn = column + 1;
+                    lastRunStartIndex = currentCharIndex;
+                    lastRunFontWidthMismatch = false;
+                    continue;
+                }
+                placeholderRun = null;
                 final int codePointWcWidth = WcWidth.width(codePoint);
                 final boolean insideCursor = (cursorX == column || (codePointWcWidth == 2 && cursorX == column + 1));
                 final boolean insideSelection = column >= selx1 && column <= selx2;
@@ -176,6 +232,11 @@ public final class TerminalRenderer {
             }
             drawTextRun(canvas, line, palette, heightOffset, lastRunStartColumn, columnWidthSinceLastRun, lastRunStartIndex, charsSinceLastRun,
                 measuredWidthForRun, cursorColor, cursorShape, lastRunStyle, reverseVideo || invertCursorTextColor || lastRunInsideSelection);
+        }
+        if (!mKittyLayer.isEmpty()) {
+            mKittyLayer.paint(mKittyLayerTarget.into(canvas), false, topRow, mFontWidth,
+                mFontLineSpacing, mFontLineSpacingAndAscent, 0);
+            mKittyLayerTarget.into(null);
         }
     }
 

@@ -20,6 +20,7 @@ public abstract class TerminalTestCase extends TestCase {
 		final ByteArrayOutputStream baos = new ByteArrayOutputStream();
 		public final List<ChangedTitle> titleChanges = new ArrayList<>();
 		public final List<String> clipboardPuts = new ArrayList<>();
+		public final List<Notification> notifications = new ArrayList<>();
 		public int bellsRung = 0;
 		public int colorsChanged = 0;
 
@@ -57,6 +58,11 @@ public abstract class TerminalTestCase extends TestCase {
 		public void onColorsChanged() {
 			colorsChanged++;
 		}
+
+		@Override
+		public void onNotification(String title, String body) {
+			notifications.add(new Notification(title, body));
+		}
 	}
 
 	public TerminalEmulator mTerminal;
@@ -86,6 +92,34 @@ public abstract class TerminalTestCase extends TestCase {
 		@Override
 		public String toString() {
 			return "ChangedTitle[oldTitle=" + oldTitle + ", newTitle=" + newTitle + "]";
+		}
+
+	}
+
+	public static final class Notification {
+		final String title;
+		final String body;
+
+		public Notification(String title, String body) {
+			this.title = title;
+			this.body = body;
+		}
+
+		@Override
+		public boolean equals(Object o) {
+			if (!(o instanceof Notification)) return false;
+			Notification other = (Notification) o;
+			return Objects.equals(title, other.title) && Objects.equals(body, other.body);
+		}
+
+		@Override
+		public int hashCode() {
+			return Objects.hash(title, body);
+		}
+
+		@Override
+		public String toString() {
+			return "Notification[title=" + title + ", body=" + body + "]";
 		}
 
 	}

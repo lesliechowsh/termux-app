@@ -15,6 +15,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
+import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -249,6 +250,9 @@ public final class TerminalSession extends TerminalOutput {
             mShellExitStatus = exitStatus;
         }
 
+        // End kitty animation loops holding this session's emulator.
+        if (mEmulator != null) mEmulator.shutdownKittyGraphics();
+
         // Stop the reader and writer threads, and close the I/O streams
         mTerminalToProcessIOQueue.close();
         mProcessToTerminalIOQueue.close();
@@ -287,6 +291,61 @@ public final class TerminalSession extends TerminalOutput {
     @Override
     public void onColorsChanged() {
         mClient.onColorsChanged(this);
+    }
+
+    @Override
+    public void onScreenChanged() {
+        notifyScreenUpdate();
+    }
+
+    @Override
+    public void postTerminalUpdate(Runnable update) {
+        mMainThreadHandler.post(update);
+    }
+
+    @Override
+    public void postTerminalUpdateDelayed(Runnable update, long delayMillis) {
+        mMainThreadHandler.postDelayed(update, delayMillis);
+    }
+
+    @Override
+    public void cancelTerminalUpdateDelayed(Runnable update) {
+        mMainThreadHandler.removeCallbacks(update);
+    }
+
+    @Override
+    public String onReadTextFromClipboard() {
+        return mClient.onReadTextFromClipboard(this);
+    }
+
+    @Override
+    public void onReadClipboard(boolean pasted, KittyClipboard.ReadCallback callback) {
+        mClient.onReadClipboard(this, pasted, callback);
+    }
+
+    @Override
+    public void onWriteClipboard(Map<String, byte[]> images, String text) {
+        mClient.onWriteClipboard(this, images, text);
+    }
+
+    @Override
+    public void onNotification(String title, String body) {
+        mClient.onNotification(this, title, body);
+    }
+
+    @Override
+    public void onKittyNotification(KittyNotification notification) {
+        mClient.onKittyNotification(this, notification);
+    }
+
+    @Override
+    public void onKittyNotificationClose(String id) {
+        mClient.onKittyNotificationClose(this, id);
+    }
+
+    @Override
+    public void onPointerShapeChanged(String shape) {
+        mClient.onPointerShapeChanged(this, shape);
     }
 
     public int getPid() {
