@@ -26,9 +26,10 @@ import java.util.Comparator;
  * to the grid by the program stays on the grid on screen. There is no per-cell slicing, so there
  * are no seams.</p>
  *
- * <p>Two passes per frame: {@code z < 0} after the cell backgrounds and before the text, so the text
- * stands on the picture, and {@code z >= 0} after everything, over the text — kitty's layering.
- * Within a pass placements go in z order, and in anchor order within one z.</p>
+ * <p>Two passes per frame: {@code z < 0} before any cell background or text, so the cells' own
+ * backgrounds cover the picture — kitty's documented layering for negative z — and {@code z >= 0}
+ * after everything, over the text. Within a pass placements go in z order, and in anchor order
+ * within one z.</p>
  */
 final class KittyLayerPainter {
 

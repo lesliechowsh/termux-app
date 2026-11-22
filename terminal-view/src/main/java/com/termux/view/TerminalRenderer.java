@@ -86,6 +86,15 @@ public final class TerminalRenderer {
 
         mKittyLayer.collect(mEmulator, topRow, Math.max(0, endRow - topRow));
 
+        if (!mKittyLayer.isEmpty()) {
+            // Negative-z kitty placements go below the cells: this pass runs before any cell
+            // background or text, so a cell's own background covers them — kitty's documented
+            // layering for z < 0. The z >= 0 pass at the end runs after everything, over the text.
+            mKittyLayer.paint(mKittyLayerTarget.into(canvas), true, topRow, mFontWidth,
+                mFontLineSpacing, mFontLineSpacingAndAscent, 0);
+            mKittyLayerTarget.into(null);
+        }
+
         float heightOffset = mFontLineSpacingAndAscent;
         for (int row = topRow; row < endRow; row++) {
             heightOffset += mFontLineSpacing;
@@ -145,14 +154,14 @@ public final class TerminalRenderer {
                            && KittyUnicodePlaceholder.diacriticValue(Character.codePointAt(line, clusterEnd, charsUsedInLine)) >= 0) {
                         clusterEnd += Character.charCount(Character.codePointAt(line, clusterEnd, charsUsedInLine));
                     }
-                    // The cell fg carries the low 24 image-id bits. This emulator keeps no
-                    // underline color in the cell style, so the placement id is unknown: passing
-                    // the default-color sentinel makes decode fall back to placement id 0, which
-                    // resolves to the image's first virtual placement. A default fg (the same
-                    // sentinel) encodes no id, and decode answers null.
+                    // kitty encodes the image id in the cell fg and the virtual placement id in
+                    // the cell bg, so several virtual placements of one image resolve by their
+                    // cells' backgrounds. A default bg decodes outside the protocol range and
+                    // decode falls back to placement id 0, the image's first virtual placement;
+                    // a default fg encodes no id and decode answers null.
                     KittyUnicodePlaceholder.Cell cell = KittyUnicodePlaceholder.decode(
                         line, currentCharIndex + charsForCodePoint, clusterEnd,
-                        TextStyle.decodeForeColor(style), TextStyle.COLOR_INDEX_FOREGROUND,
+                        TextStyle.decodeForeColor(style), TextStyle.decodeBackColor(style),
                         TextStyle.COLOR_INDEX_FOREGROUND, placeholderRun);
                     placeholderRun = cell;
                     if (cell != null && mEmulator.getKittyImagePlaceholder(cell.imageId, cell.placementId, mKittyPlaceholder)
