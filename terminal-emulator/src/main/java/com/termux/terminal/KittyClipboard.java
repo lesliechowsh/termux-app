@@ -1,11 +1,12 @@
 package com.termux.terminal;
 
+import android.util.Base64;
+
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -206,7 +207,7 @@ public final class KittyClipboard {
         }
         String requested;
         try {
-            requested = new String(Base64.getDecoder().decode(payload.trim()), StandardCharsets.UTF_8);
+            requested = new String(Base64.decode(payload.trim(), Base64.DEFAULT), StandardCharsets.UTF_8);
         } catch (IllegalArgumentException e) {
             return; // "ignore invalid reads"
         }
@@ -324,7 +325,7 @@ public final class KittyClipboard {
         int whole = mWriteCarry.length() / 4 * 4;
         if (whole == 0) return;
         try {
-            byte[] decoded = Base64.getDecoder().decode(mWriteCarry.substring(0, whole));
+            byte[] decoded = Base64.decode(mWriteCarry.substring(0, whole), Base64.DEFAULT);
             mWriteCarry.delete(0, whole);
             if (mWriteTotal + decoded.length > MAX_WRITE_BYTES) {
                 writeError("EFBIG", terminator, handler);
@@ -349,7 +350,7 @@ public final class KittyClipboard {
         if (!mWriting || mWriteFailed) return;
         try {
             String target = decodeMime(mimeB64);
-            String aliases = new String(Base64.getDecoder().decode(payload.trim()), StandardCharsets.UTF_8);
+            String aliases = new String(Base64.decode(payload.trim(), Base64.DEFAULT), StandardCharsets.UTF_8);
             mAliases.add(new String[] {target, aliases.trim().toLowerCase(Locale.ROOT)});
         } catch (IllegalArgumentException e) {
             writeError("EINVAL", terminator, handler);
@@ -429,13 +430,13 @@ public final class KittyClipboard {
     }
 
     private static String b64(String text) {
-        return Base64.getEncoder().encodeToString(text.getBytes(StandardCharsets.UTF_8));
+        return Base64.encodeToString(text.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP);
     }
 
     /** {@code value} base64-decoded, or null when it is not base64. */
     private static String decodeOrNull(String value) {
         try {
-            return new String(Base64.getDecoder().decode(value.trim()), StandardCharsets.UTF_8);
+            return new String(Base64.decode(value.trim(), Base64.DEFAULT), StandardCharsets.UTF_8);
         } catch (IllegalArgumentException e) {
             return null;
         }
@@ -443,7 +444,7 @@ public final class KittyClipboard {
 
     private static String decodeMime(String mimeB64) {
         if (mimeB64.isEmpty()) return "";
-        return new String(Base64.getDecoder().decode(mimeB64), StandardCharsets.UTF_8).trim().toLowerCase(Locale.ROOT);
+        return new String(Base64.decode(mimeB64, Base64.DEFAULT), StandardCharsets.UTF_8).trim().toLowerCase(Locale.ROOT);
     }
 
     /** The spec's multiplexer id: only {@code [a-zA-Z0-9-_+.]} survive. */
@@ -474,9 +475,9 @@ public final class KittyClipboard {
         }
 
         void data(String mime, byte[] bytes) {
-            String mimeB64 = Base64.getEncoder().encodeToString(mime.getBytes(StandardCharsets.UTF_8));
+            String mimeB64 = Base64.encodeToString(mime.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP);
             mHandler.write("\033]5522;type=read:status=DATA:mime=" + mimeB64 + mIdSuffix + ";"
-                + Base64.getEncoder().encodeToString(bytes) + mTerminator);
+                + Base64.encodeToString(bytes, Base64.NO_WRAP) + mTerminator);
         }
     }
 }
